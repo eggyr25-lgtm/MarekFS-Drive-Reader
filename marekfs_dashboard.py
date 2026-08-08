@@ -11,7 +11,7 @@ from tkinter.font import Font
 from ui_custom import theme_existing_window
 
 from marekfs_core import (
-    format_bytes, THEORETICAL_MAX_FILES_64BIT, DEFAULT_DIR_START_SECTOR,
+        format_bytes, MAX_FILE_COUNT, DEFAULT_DIR_START_SECTOR,
     SECTOR_SIZE, DIRECTORY_ENTRY_SIZE, FILENAME_MAX_LEN,
     open_drive, read_sectors,
 )
@@ -33,10 +33,10 @@ def _count_files(drive_path):
     try:
         fd = open_drive(drive_path, read_write=False)
         try:
-            dir_sectors = (THEORETICAL_MAX_FILES_64BIT and 0) or 0  # noop
-            # use the default pre-sized directory count
-            from marekfs_core import DEFAULT_DIR_SECTORS_COUNT
-            data = read_sectors(fd, DEFAULT_DIR_START_SECTOR, DEFAULT_DIR_SECTORS_COUNT)
+                dir_sectors = (MAX_FILE_COUNT and 0) or 0  # noop
+                # use the default pre-sized directory count
+                from marekfs_core import DEFAULT_DIR_SECTORS_COUNT
+                data = read_sectors(fd, DEFAULT_DIR_START_SECTOR, DEFAULT_DIR_SECTORS_COUNT)
         finally:
             os.close(fd)
         total = len(data) // DIRECTORY_ENTRY_SIZE
@@ -95,7 +95,7 @@ class DashboardWindow:
             if f.lower().endswith((".img", ".marekfs", ".bin")) or f.lower().endswith(".marekarchv"):
                 disks.append(os.path.join(folder, f))
         total = 0
-        max_files_str = f"{THEORETICAL_MAX_FILES_64BIT:,}"
+        max_files_str = f"{MAX_FILE_COUNT:,}"
         for path in disks:
             try:
                 size = os.path.getsize(path)

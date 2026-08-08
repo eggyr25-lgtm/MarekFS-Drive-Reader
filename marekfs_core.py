@@ -43,20 +43,19 @@ JOURNAL_START_SECTOR = 1
 JOURNAL_MAGIC = b"MKJOURNAL1"
 ARCHIVE_MAGIC = b"MAREKARCHV"
 
-MAX_JOURNAL_PAYLOAD_SIZE = 72 * 1024 * 1024 * 1024  # 72 GB max per journaled write
+MAX_JOURNAL_PAYLOAD_SIZE = 100 * 1024 * 1024  # 100 MB max per journaled write (realistic limit)
 JOURNAL_HEADER_SIZE = len(JOURNAL_MAGIC) + 8 + 4 + 1
 JOURNAL_SECTORS = (JOURNAL_HEADER_SIZE + MAX_JOURNAL_PAYLOAD_SIZE + SECTOR_SIZE - 1) // SECTOR_SIZE
 
 # The on-disk directory is pre-sized once for MAX_FILE_COUNT entries; growing
 # it later would overwrite file data and lose the directory on reload. We keep
-# a practical pre-size (65,536) for the actual layout, and expose the 64-bit
-# theoretical ceiling separately for the dashboard display.
-MAX_FILE_COUNT = 1 << 16
-THEORETICAL_MAX_FILES_64BIT = (1 << 64) - 1  # displayed as the format's limit
+# a practical pre-size (65,536) for the actual layout - this is the real limit,
+# not a "64-bit theoretical max" that doesn't exist in the implementation.
+MAX_FILE_COUNT = 1 << 16  # 65,536 files maximum (practical limit)
 DEFAULT_DIR_SECTORS_COUNT = (MAX_FILE_COUNT * DIRECTORY_ENTRY_SIZE + SECTOR_SIZE - 1) // SECTOR_SIZE
 
 DEFAULT_DIR_START_SECTOR = JOURNAL_START_SECTOR + JOURNAL_SECTORS
-DEFAULT_DATA_AREA_RESERVE = 72 * 1024 * 1024 * 1024
+DEFAULT_DATA_AREA_RESERVE = 1024 * 1024 * 1024  # 1 GB default data area (realistic)
 
 # --- Cache (volatile, buried deep) ----------------------------------------
 CACHE_MAX_SIZE = 48 * 1024 * 1024 * 1024  # 48 GB hard cap
@@ -64,6 +63,34 @@ CACHE_MAGIC = b"MAREKCACHE"
 CACHE_HEADER_SIZE = len(CACHE_MAGIC) + 8 + 1
 CACHE_START_SECTOR = DEFAULT_DIR_START_SECTOR + DEFAULT_DIR_SECTORS_COUNT + (DEFAULT_DATA_AREA_RESERVE // SECTOR_SIZE)
 CACHE_SECTORS = (CACHE_MAX_SIZE + CACHE_HEADER_SIZE + SECTOR_SIZE - 1) // SECTOR_SIZE
+
+# --- Cache sizing (partition-specific, up to 25% of the disk) -------------
+CACHE_DISK_FRACTION = 0.25
+
+
+def cache_size_for_disk(total_size: int) -> int:
+    """The cache region may use up to 25% of the disk, capped at the hard cap."""
+    target = int(total_size * CACHE_DISK_FRACTION)
+    return max(SECTOR_SIZE, min(int(CACHE_MAX_SIZE), target))
+
+
+def partition_cache_region(partition, total_size: int):
+    """Return (cache_start_sector, cache_sectors, cache_max_size) for a
+    partition. The cache is placed at the high end of that partition's data
+    area so it is partition-specific. Falls back to the legacy global layout
+    when no partition is supplied (e.g. an unpartitioned disk)."""
+    if not partition:
+        return CACHE_START_SECTOR, CACHE_SECTORS, CACHE_MAX_SIZE
+    end_sector = max(1, int(total_size) // SECTOR_SIZE)
+    part_start = int(partition.get("start_sector") or PARTITION_TABLE_SECTORS)
+    part_end = part_start + int(partition.get("size_bytes", 0)) // SECTOR_SIZE
+    part_end = min(part_end, end_sector)
+    cache_max = cache_size_for_disk(total_size)
+    cache_sectors = max(1, (cache_max + CACHE_HEADER_SIZE + SECTOR_SIZE - 1) // SECTOR_SIZE)
+    cache_start = part_end - cache_sectors
+    if cache_start <= part_start:
+        cache_start = part_start + 1
+    return cache_start, cache_sectors, cache_max
 
 LOCKS_DIR = ".marekfs_locks"
 
@@ -367,19 +394,209 @@ def read_file_payload(data: bytes, password: str = "", attributes: int = 0, raw_
     return payload[:raw_size]
 
 
+def get_available_drives() -> list:
+    """Get list of available drives on Windows.
+    
+    Returns a list of tuples: (display_name, path)
+    Example: [("C:\\ (System)", "\\\\.\\C:"), ("D:\\ (Data)", "\\\\.\\D:")]
+    """
+    drives = []
+    try:
+        import string
+        from ctypes import windll
+        
+        # Get drive types
+        for letter in string.ascii_uppercase:
+            drive_path = f"{letter}:\\"
+            try:
+                drive_type = windll.kernel32.GetDriveTypeW(drive_path)
+                if drive_type != 0:  # DRIVE_UNKNOWN
+                    type_names = {
+                        1: " (No Root Dir)",
+                        2: " (Removable)",
+                        3: " (Fixed)",
+                        4: " (Network)",
+                        5: " (CD-ROM)",
+                        6: " (RAM Disk)"
+                    }
+                    type_str = type_names.get(drive_type, "")
+                    display = f"{letter}:\\{type_str}"
+                    raw_path = f"\\\\.\\{letter}:"
+                    drives.append((display, raw_path))
+            except Exception:
+                pass
+        
+        # Also add PhysicalDrive entries if they exist
+        for i in range(0, 16):
+            phys_path = f"\\\\.\\PhysicalDrive{i}"
+            try:
+                # Test if it exists by trying to open it
+                fd = os.open(phys_path, os.O_RDONLY)
+                os.close(fd)
+                drives.append((f"PhysicalDrive{i}", phys_path))
+            except (PermissionError, OSError):
+                # Skip drives we can't access
+                pass
+    except Exception:
+        pass
+    
+    return drives
+
+
+def _normalize_windows_drive_path(path: str) -> str:
+    """Convert Windows drive paths to the raw device path format required for sector I/O.
+    
+    On Windows, os.open() cannot access 'C:\\' directly for raw sector access.
+    It must use the special device path format:
+    - 'C:\\' or 'C:' -> '\\\\.\\C:'
+    - '\\\\.\\C:' -> '\\\\.\\C:' (already correct)
+    - '\\\\.\\PhysicalDrive1' -> '\\\\.\\PhysicalDrive1' (already correct)
+    - Image files like 'marekfs_disk.img' -> 'marekfs_disk.img' (unchanged)
+    """
+    # Already in raw device format
+    if path.startswith("\\\\.\\"):
+        return path
+    
+    # Check if it's a Windows drive letter (e.g., "C:", "C:\\", "D:\\")
+    if re.match(r'^[A-Za-z]:[\\/]?$', path):
+        drive_letter = path[0].upper()
+        return f"\\\\.\\{drive_letter}:"
+    
+    # Not a Windows drive path, return as-is (likely an image file)
+    return path
+
+
 def open_drive(path: str, read_write: bool = False):
-    if not path.startswith("\\\\.\\") and not os.path.exists(path):
+    # Normalize Windows drive paths to raw device format
+    normalized_path = _normalize_windows_drive_path(path)
+    
+    if not normalized_path.startswith("\\\\.\\") and not os.path.exists(normalized_path):
         total_sectors = DEFAULT_DIR_START_SECTOR + DEFAULT_DIR_SECTORS_COUNT
         total_size = total_sectors * SECTOR_SIZE + DEFAULT_DATA_AREA_RESERVE + CACHE_MAX_SIZE
-        with open(path, "wb") as f:
+        with open(normalized_path, "wb") as f:
             f.seek(total_size - 1)
             f.write(b"\x00")
     flags = (os.O_RDWR if read_write else os.O_RDONLY)
     if hasattr(os, "O_BINARY"): flags |= os.O_BINARY
     try:
-        return os.open(path, flags)
+        return os.open(normalized_path, flags)
     except PermissionError:
         raise PermissionError(f"Access Denied for '{path}'. Run Python as Administrator to write to physical drives!")
+
+
+def get_drive_size(fd) -> int:
+    """Return the total byte size of the open drive/image file descriptor.
+
+    Works for image files (fstat/seek-to-end). Windows raw devices that do not
+    report a size through the standard library fall back to the legacy default
+    image layout."""
+    try:
+        st = os.fstat(fd)
+        if st and st.st_size and st.st_size > 0:
+            return st.st_size
+    except Exception:
+        pass
+    try:
+        cur = os.lseek(fd, 0, os.SEEK_CUR)
+        end = os.lseek(fd, 0, os.SEEK_END)
+        os.lseek(fd, cur, os.SEEK_SET)
+        if end > 0:
+            return end
+    except Exception:
+        pass
+    return ((DEFAULT_DIR_START_SECTOR + DEFAULT_DIR_SECTORS_COUNT) * SECTOR_SIZE
+            + DEFAULT_DATA_AREA_RESERVE + CACHE_MAX_SIZE)
+
+
+def _windows_device_size(device_path: str) -> int:
+    """Return the exact size (bytes) of a raw Windows volume / physical-drive
+    path via DeviceIoControl. Returns 0 on any failure."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        OPEN_EXISTING = 3
+
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        kernel32.DeviceIoControl.restype = wintypes.BOOL
+        handle = kernel32.CreateFileW(
+            device_path, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, None,
+            OPEN_EXISTING, 0, None,
+        )
+        if not handle or handle == wintypes.HANDLE(-1):
+            return 0
+        try:
+            # Preferred: exact length in bytes (IOCTL_DISK_GET_LENGTH_INFO).
+            IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+            buf = (ctypes.c_ubyte * 8)()
+            n = wintypes.DWORD(0)
+            ok = kernel32.DeviceIoControl(
+                handle, IOCTL_DISK_GET_LENGTH_INFO, None, 0,
+                ctypes.byref(buf), 8, ctypes.byref(n), None,
+            )
+            if ok:
+                length = int.from_bytes(bytes(buf[:8]), "little")
+                if length > 0:
+                    return length
+
+            # Fallback: geometry EX exposes the disk size in bytes directly.
+            class GEOMETRY_EX(ctypes.Structure):
+                _fields_ = [
+                    ("Cylinders", ctypes.c_int64),
+                    ("MediaType", ctypes.c_int),
+                    ("TracksPerCylinder", ctypes.c_uint32),
+                    ("SectorsPerTrack", ctypes.c_uint32),
+                    ("BytesPerSector", ctypes.c_uint32),
+                    ("DiskSize", ctypes.c_int64),
+                ]
+
+            IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+            geom = GEOMETRY_EX()
+            ok = kernel32.DeviceIoControl(
+                handle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, None, 0,
+                ctypes.byref(geom), ctypes.sizeof(geom), ctypes.byref(n), None,
+            )
+            if ok and geom.DiskSize > 0:
+                return geom.DiskSize
+            return 0
+        finally:
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+    except Exception:
+        return 0
+
+
+def get_drive_size_bytes(path: str) -> int:
+    """Return the exact total byte size of a drive or image path.
+
+    Raw Windows devices (\\\\.\\C:, \\\\.\\PhysicalDriveN) are measured with
+    DeviceIoControl so the real 465 GB-class size is used; regular image files
+    are measured with getsize. Falls back to the legacy default layout only
+    when the size cannot be determined at all."""
+    normalized = _normalize_windows_drive_path(path)
+    if normalized.startswith("\\\\.\\"):
+        size = _windows_device_size(normalized)
+        if size and size > 0:
+            return size
+    try:
+        if os.path.exists(normalized):
+            sz = os.path.getsize(normalized)
+            if sz and sz > 0:
+                return sz
+    except Exception:
+        pass
+    return ((DEFAULT_DIR_START_SECTOR + DEFAULT_DIR_SECTORS_COUNT) * SECTOR_SIZE
+            + DEFAULT_DATA_AREA_RESERVE + CACHE_MAX_SIZE)
 
 
 def read_sectors(fd, start_sector: int, num_sectors: int) -> bytes:
@@ -441,6 +658,87 @@ def read_sectors_chunked(fd, start_sector: int, num_sectors: int, progress=None)
             try: progress(done, total_bytes)
             except Exception: pass
     return b"".join(chunks)
+
+
+def clone_drive(src_path: str, dst_path: str, progress=None, verify: bool = False) -> bool:
+    """Clone a source drive/image (`src_path`) to destination (`dst_path`).
+
+    - `progress(bytes_done, total_bytes)` is called periodically if provided.
+    - `verify` will attempt a simple size check after copy (no cryptographic verify).
+
+    Returns True on success, raises on error.
+    """
+    src_fd = None
+    dst_fd = None
+    try:
+        src_fd = open_drive(src_path, read_write=False)
+        dst_fd = open_drive(dst_path, read_write=True)
+
+        src_size = get_drive_size(src_fd)
+        dst_size = get_drive_size(dst_fd)
+        if dst_size < src_size:
+            raise ValueError(f"Destination size ({dst_size}) is smaller than source ({src_size})")
+
+        os.lseek(src_fd, 0, os.SEEK_SET)
+        os.lseek(dst_fd, 0, os.SEEK_SET)
+
+        total = src_size
+        done = 0
+        # Copy in FILE_CHUNK_SIZE slices, each read in IO_CHUNK_SIZE pieces
+        while done < total:
+            to_copy = min(FILE_CHUNK_SIZE, total - done)
+            parts = []
+            remaining = to_copy
+            while remaining > 0:
+                read_bytes = os.read(src_fd, min(IO_CHUNK_SIZE, remaining))
+                if not read_bytes:
+                    break
+                parts.append(read_bytes)
+                remaining -= len(read_bytes)
+
+            if not parts:
+                break
+
+            block = b"".join(parts)
+            view = memoryview(block)
+            written = 0
+            while written < len(block):
+                n = os.write(dst_fd, view[written:written + IO_CHUNK_SIZE])
+                if n <= 0:
+                    raise IOError("write() made no progress while cloning drive")
+                written += n
+
+            try:
+                os.fsync(dst_fd)
+            except Exception:
+                pass
+
+            done += len(block)
+            if progress:
+                try:
+                    progress(done, total)
+                except Exception:
+                    pass
+
+        # optional quick verify: sizes equal
+        if verify:
+            os.lseek(dst_fd, 0, os.SEEK_SET)
+            final_dst_size = get_drive_size(dst_fd)
+            if final_dst_size < src_size:
+                raise IOError("Verification failed: destination smaller than source after copy")
+
+        return True
+    finally:
+        try:
+            if src_fd is not None:
+                os.close(src_fd)
+        except Exception:
+            pass
+        try:
+            if dst_fd is not None:
+                os.close(dst_fd)
+        except Exception:
+            pass
 
 
 def set_journal_status(fd, j_padded_buffer: bytearray, status_byte: bytes):
@@ -1059,21 +1357,49 @@ def write_partition_table(fd, partitions, active_index):
     write_sectors(fd, 0, padded)
 
 
-def init_default_partitions(num=4):
+def is_marekfs_disk(fd) -> bool:
+    """Return True if the drive/image is a MarekFS disk (partition table magic
+    in sector 0, or a legacy journal magic in sector 1). Used to avoid parsing
+    foreign filesystems (NTFS, FAT, …) as a MarekFS directory table."""
+    try:
+        sector0 = read_sectors(fd, 0, 1)
+        if sector0.startswith(PARTITION_MAGIC):
+            return True
+        sector1 = read_sectors(fd, 1, 1)
+        if sector1.startswith(JOURNAL_MAGIC):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def init_default_partitions(num=1, disk_size_bytes=None):
     """Create `num` default partitions with random ids. Partition 0 starts
-    right after the partition table; each gets an equal slice of the
-    data area reserve."""
+    right after the partition table. The default single partition spans the
+    maximum data area of the disk (so both the journal and that partition's
+    cache fit); when several partitions are requested they split the remaining
+    disk evenly."""
+    if num <= 0:
+        num = 1
+    if disk_size_bytes is None or disk_size_bytes <= 0:
+        disk_size_bytes = ((DEFAULT_DIR_START_SECTOR + DEFAULT_DIR_SECTORS_COUNT) *
+                           SECTOR_SIZE + DEFAULT_DATA_AREA_RESERVE + CACHE_MAX_SIZE)
     partitions = []
-    per_partition_sectors = DEFAULT_DATA_AREA_RESERVE // SECTOR_SIZE // max(num, 1)
     start = PARTITION_TABLE_SECTORS
     for i in range(num):
+        remaining = disk_size_bytes - start * SECTOR_SIZE
+        size_bytes = max(0, remaining // max(num - i, 1))
+        # Last partition absorbs any rounding remainder so the whole data area
+        # of the disk is covered (maximum size for the disk).
+        if i == num - 1:
+            size_bytes = max(0, remaining)
         partitions.append({
             "id": generate_partition_id(),
             "flags": 0,
             "start_sector": start,
-            "size_bytes": per_partition_sectors * SECTOR_SIZE,
+            "size_bytes": size_bytes,
         })
-        start += per_partition_sectors
+        start += size_bytes // SECTOR_SIZE
     return partitions
 
 
@@ -1145,6 +1471,106 @@ def set_extended_fs_support(enabled_names):
     cfg = load_programdata_config()
     cfg["ExtendedFilesystemSupport"] = enabled
     return save_programdata_config(cfg)
+
+
+# ===========================================================================
+# Extended Filesystem Parser Integration
+# ============================================================================
+
+def read_extended_filesystem(drive_path, filesystem_name=None):
+    """
+    Read an extended filesystem using the parser system.
+    
+    Args:
+        drive_path: Path to disk/image (e.g., '\\\\.\\PhysicalDrive0')
+        filesystem_name: Specific filesystem to use (None for auto-detect)
+        
+    Returns:
+        Tuple of (parser, error_message)
+    """
+    try:
+        from filesystems import SectorReader, get_parser, detect_filesystem
+        from filesystems.common.sector_reader import SectorReader as SR
+    except ImportError as e:
+        return None, f"Filesystem parser module not available: {e}"
+    
+    try:
+        reader = SectorReader(drive_path)
+    except Exception as e:
+        return None, f"Error opening drive: {e}"
+
+    try:
+        if filesystem_name:
+            parser_class = get_parser(filesystem_name)
+            if not parser_class:
+                reader.close()
+                return None, f"Unsupported filesystem: {filesystem_name}"
+        else:
+            parser_class = detect_filesystem(reader)
+            if not parser_class:
+                reader.close()
+                return None, "Could not detect filesystem type"
+
+        parser = parser_class(reader)
+        if parser.mount():
+            # Keep reader open; caller is responsible for parsing then closing.
+            parser._sector_reader = reader
+            return parser, None
+        else:
+            reader.close()
+            return None, f"Failed to mount {parser_class.FS_NAME}"
+    except Exception as e:
+        reader.close()
+        return None, f"Error accessing drive: {e}"
+
+
+def list_extended_fs_files(drive_path, filesystem_name=None, directory_path="/"):
+    """
+    List files in an extended filesystem.
+    
+    Args:
+        drive_path: Path to disk/image
+        filesystem_name: Filesystem type (None for auto-detect)
+        directory_path: Directory to list
+        
+    Returns:
+        Tuple of (file_list, error_message)
+    """
+    parser, error = read_extended_filesystem(drive_path, filesystem_name)
+    if error:
+        return [], error
+    
+    try:
+        files = parser.list_directory(directory_path)
+        return [f.to_dict() for f in files], None
+    except Exception as e:
+        return [], f"Error listing directory: {e}"
+
+
+def read_extended_fs_file(drive_path, file_path, filesystem_name=None, size=None, offset=0):
+    """
+    Read a file from an extended filesystem.
+    
+    Args:
+        drive_path: Path to disk/image
+        file_path: Path to file
+        filesystem_name: Filesystem type (None for auto-detect)
+        size: Number of bytes to read
+        offset: Starting offset in file
+        
+    Returns:
+        Tuple of (file_data, error_message)
+    """
+    parser, error = read_extended_filesystem(drive_path, filesystem_name)
+    if error:
+        return None, error
+    
+    try:
+        data = parser.read_file(file_path, size=size, offset=offset)
+        return data, None
+    except Exception as e:
+        return None, f"Error reading file: {e}"
+
 
 
 # ===========================================================================

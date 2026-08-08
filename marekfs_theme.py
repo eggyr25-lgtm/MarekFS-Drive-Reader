@@ -7,6 +7,7 @@ shift hue together with per-zone offsets. No theme_use() is re-called on
 ticks, so the layout never wiggles."""
 import colorsys
 import math
+import random
 import tkinter as tk
 from tkinter import ttk
 
@@ -53,12 +54,48 @@ THEMES = {
         "btn_bg": "#5a4408", "btn_fg": "#fff3cf", "btn_active": "#7a5c0a",
         "glossy": True, "font": ("Segoe UI", 10),
     },
+    "Camo": {
+        "bg": "#2d3a1f", "fg": "#c4cbb3", "accent": "#8b9a6d",
+        "surface": "#3a4a2a", "entry": "#1f2814",
+        "btn_bg": "#4a5d32", "btn_fg": "#d4dbc3", "btn_active": "#5d7342",
+        "glossy": False, "font": ("Segoe UI", 10),
+        "pattern": "camo",
+    },
+    "Fizzy": {
+        "bg": "#3e2723", "fg": "#ffccbc", "accent": "#ff8a65",
+        "surface": "#4e342e", "entry": "#2d1f1c",
+        "btn_bg": "#6d4c41", "btn_fg": "#ffccbc", "btn_active": "#8d6e63",
+        "glossy": True, "font": ("Segoe UI", 10),
+        "pattern": "fizzy",
+    },
+    "Chocolate": {
+        "bg": "#3e2723", "fg": "#ffccbc", "accent": "#d7ccc8",
+        "surface": "#4e342e", "entry": "#2d1f1c",
+        "btn_bg": "#5d4037", "btn_fg": "#ffccbc", "btn_active": "#6d4c41",
+        "glossy": True, "font": ("Segoe UI", 10),
+        "pattern": "chocolate",
+    },
+    "Lightning": {
+        "bg": "#0a0a0f", "fg": "#e0e0ff", "accent": "#00e5ff",
+        "surface": "#12121f", "entry": "#050508",
+        "btn_bg": "#1a1a2e", "btn_fg": "#e0e0ff", "btn_active": "#2a2a4e",
+        "glossy": True, "font": ("Segoe UI", 10),
+        "pattern": "lightning",
+        "lightning_probability": 20,  # 20% chance per second (1 strike every ~5s)
+    },
     "Rainbow": {
         "bg": "#0d0d12", "fg": "#f0f0f5", "accent": "#ff0044",
         "surface": "#16161f", "entry": "#0a0a10",
         "btn_bg": "#1e1e2e", "btn_fg": "#f0f0f5", "btn_active": "#2e2e42",
         "glossy": True, "font": ("Segoe UI", 10),
         "rainbow": True,
+    },
+    "Demonic": {
+        "bg": "#1a0000", "fg": "#ff4444", "accent": "#ff0000",
+        "surface": "#2a0505", "entry": "#1f0000",
+        "btn_bg": "#4a0f0f", "btn_fg": "#ff6666", "btn_active": "#6a1515",
+        "glossy": True, "font": ("Segoe UI", 10),
+        "pattern": "demonic",
     },
 }
 
@@ -69,6 +106,9 @@ _DEFAULT = {
     "rainbow": False,
     "glossy": True,
     "font": ("Segoe UI", 10),
+    "pattern": None,
+    "transparency": 1.0,
+    "aero_blur": False,
 }
 
 
@@ -663,3 +703,474 @@ def theme_existing_window(win, parent=None, title=None, min_size=None):
         register_rainbow_window(win)
         _sync_master_animator(win)
     return win
+
+# ---------------------------------------------------------------------------
+# Fizzy Theme - Rising Bubbles
+# ---------------------------------------------------------------------------
+
+class FizzyBubbleAnimator:
+    """Animates rising bubbles for the Fizzy theme."""
+    def __init__(self, root, canvas_widget):
+        self.root = root
+        self.canvas = canvas_widget
+        self.bubbles = []
+        self.running = False
+        self._id = None
+    
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self._animate()
+    
+    def stop(self):
+        self.running = False
+        if self._id:
+            try:
+                self.root.after_cancel(self._id)
+            except Exception:
+                pass
+        self._id = None
+        self.bubbles.clear()
+        if self.canvas:
+            try:
+                self.canvas.delete("all")
+            except Exception:
+                pass
+    
+    def _animate(self):
+        if not self.running:
+            return
+        
+        try:
+            if random.random() < 0.4 and len(self.bubbles) < 25:
+                x = random.randint(0, 400)
+                y = 400
+                size = random.randint(3, 10)
+                speed = random.uniform(0.5, 2.5)
+                bubble_id = self.canvas.create_oval(x, y, x+size, y+size, 
+                                                     fill="#ffccbc", outline="#ff8a65", width=1)
+                self.bubbles.append((bubble_id, x, y, size, speed))
+            
+            new_bubbles = []
+            for bubble_id, x, y, size, speed in self.bubbles:
+                y -= speed
+                if y > -size:
+                    self.canvas.coords(bubble_id, x, y, x+size, y+size)
+                    new_bubbles.append((bubble_id, x, y, size, speed))
+                else:
+                    try:
+                        self.canvas.delete(bubble_id)
+                    except Exception:
+                        pass
+            self.bubbles = new_bubbles
+        except Exception:
+            pass
+        
+        self._id = self.root.after(50, self._animate)
+
+
+
+# ---------------------------------------------------------------------------
+# Chocolate Theme - Melting Bars
+# ---------------------------------------------------------------------------
+
+class ChocolateMeltingAnimator:
+    """Animates melting chocolate bars for the Chocolate theme."""
+    def __init__(self, root, canvas_widget):
+        self.root = root
+        self.canvas = canvas_widget
+        self.chocolate_bars = []
+        self.melted_bars = []
+        self.running = False
+        self._id = None
+        self._melt_id = None
+    
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self._create_bars()
+        self._animate()
+        self._schedule_melting()
+    
+    def stop(self):
+        self.running = False
+        if self._id:
+            try:
+                self.root.after_cancel(self._id)
+            except Exception:
+                pass
+        if self._melt_id:
+            try:
+                self.root.after_cancel(self._melt_id)
+            except Exception:
+                pass
+        self._id = None
+        self._melt_id = None
+        self.chocolate_bars.clear()
+        self.melted_bars.clear()
+        if self.canvas:
+            try:
+                self.canvas.delete("all")
+            except Exception:
+                pass
+    
+    def _create_bars(self):
+        try:
+            self.canvas.delete("all")
+            self.chocolate_bars.clear()
+            self.melted_bars.clear()
+            for row in range(5):
+                for col in range(8):
+                    x = col * 50
+                    y = row * 40
+                    bar_id = self.canvas.create_rectangle(x, y, x+45, y+35, 
+                                                           fill="#5d4037", outline="#3e2723", width=2)
+                    for seg in range(4):
+                        self.canvas.create_line(x + seg*11, y, x + seg*11, y+35, 
+                                              fill="#3e2723", width=1)
+                    self.chocolate_bars.append((bar_id, x, y, 45, 35, False))
+        except Exception:
+            pass
+    
+    def _schedule_melting(self):
+        if not self.running:
+            return
+        delay = random.randint(30000, 120000)
+        self._melt_id = self.root.after(delay, self._melt_random_bar)
+    
+    def _melt_random_bar(self):
+        if not self.running or not self.chocolate_bars:
+            self._schedule_melting()
+            return
+        
+        try:
+            available = [(i, bar) for i, bar in enumerate(self.chocolate_bars) if not bar[5]]
+            if not available:
+                self._schedule_melting()
+                return
+            
+            idx, (bar_id, x, y, w, h, melted) = random.choice(available)
+            self.chocolate_bars[idx] = (bar_id, x, y, w, h, True)
+            self.canvas.itemconfig(bar_id, fill="#3e2723", outline="#1a0f0a")
+            
+            drip_y = y + h
+            for _ in range(3):
+                drip_x = x + random.randint(5, w-5)
+                drip_h = random.randint(10, 25)
+                drip_id = self.canvas.create_rectangle(drip_x-2, drip_y, 
+                                                       drip_x+2, drip_y+drip_h,
+                                                       fill="#5d4037", outline="#3e2723")
+                self.melted_bars.append((drip_id, drip_x, drip_y, 4, drip_h))
+        except Exception:
+            pass
+        
+        self._schedule_melting()
+    
+    def unmelt_bars(self):
+        try:
+            for drip_id, _, _, _, _ in self.melted_bars:
+                self.canvas.delete(drip_id)
+            self.melted_bars.clear()
+            
+            for i, (bar_id, x, y, w, h, melted) in enumerate(self.chocolate_bars):
+                if melted:
+                    self.canvas.itemconfig(bar_id, fill="#5d4037", outline="#3e2723", width=2)
+                    self.chocolate_bars[i] = (bar_id, x, y, w, h, False)
+        except Exception:
+            pass
+    
+    def _animate(self):
+        if not self.running:
+            return
+        try:
+            for i, (drip_id, x, y, w, h) in enumerate(self.melted_bars):
+                if h < 50:
+                    new_h = h + 0.1
+                    self.canvas.coords(drip_id, x-2, y, x+2, y+new_h)
+                    self.melted_bars[i] = (drip_id, x, y, w, new_h)
+        except Exception:
+            pass
+        
+        self._id = self.root.after(100, self._animate)
+
+
+
+# ---------------------------------------------------------------------------
+# Lightning Theme - Lightning Strikes
+# ---------------------------------------------------------------------------
+
+class LightningAnimator:
+    """Animates lightning strikes for the Lightning theme."""
+    def __init__(self, root, canvas_widget=None, file_list_widget=None, 
+                 strike_probability=5):
+        self.root = root
+        self.canvas = canvas_widget
+        self.file_list = file_list_widget
+        self.strike_probability = max(0, min(100, strike_probability))
+        self.running = False
+        self._id = None
+        self._strike_timer = None
+        self._fade_timer = None
+        self.strike_count = 0
+        self.shocked_files = []
+    
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self._schedule_strike()
+    
+    def stop(self):
+        self.running = False
+        self._cancel_timers()
+        self._clear_effects()
+    
+    def set_probability(self, probability):
+        self.strike_probability = max(0, min(100, probability))
+    
+    def _cancel_timers(self):
+        for attr in ("_id", "_strike_timer", "_fade_timer"):
+            timer = getattr(self, attr, None)
+            if timer:
+                try:
+                    self.root.after_cancel(timer)
+                except Exception:
+                    pass
+        self._id = None
+        self._strike_timer = None
+        self._fade_timer = None
+    
+    def _clear_effects(self):
+        self.shocked_files.clear()
+        if self.canvas:
+            try:
+                self.canvas.delete("lightning")
+            except Exception:
+                pass
+    
+    def _schedule_strike(self):
+        if not self.running:
+            return
+        self._strike_timer = self.root.after(1000, self._check_strike)
+    
+    def _check_strike(self):
+        if not self.running:
+            return
+        roll = random.randint(1, 100)
+        if roll <= self.strike_probability:
+            self._strike()
+        self._schedule_strike()
+    
+    def _strike(self):
+        if not self.running:
+            return
+        
+        try:
+            # Get canvas dimensions to keep lightning visible
+            canvas_width = self.canvas.winfo_width() or 600
+            canvas_height = self.canvas.winfo_height() or 110
+            
+            # Keep lightning within canvas bounds
+            x1 = random.randint(50, max(51, canvas_width - 50))
+            y1 = 0
+            segments = random.randint(3, 5)
+            points = [(x1, y1)]
+            
+            x = x1
+            y = y1
+            # Each segment goes down 15-35 pixels to stay within 110px canvas
+            for _ in range(segments):
+                x += random.randint(-40, 40)
+                x = max(10, min(canvas_width - 10, x))  # Clamp to canvas width
+                y += random.randint(15, 35)
+                y = min(canvas_height - 5, y)  # Clamp to canvas height
+                points.append((x, y))
+            
+            flat_points = []
+            for px, py in points:
+                flat_points.extend([px, py])
+            
+            bolt_id = self.canvas.create_line(*flat_points, fill="#00e5ff", width=3, 
+                                              capstyle=tk.ROUND, joinstyle=tk.ROUND, tags="lightning")
+            glow_id = self.canvas.create_line(*flat_points, fill="#ffffff", width=1, 
+                                              capstyle=tk.ROUND, joinstyle=tk.ROUND, tags="lightning")
+            
+            original_bg = self.canvas["bg"]
+            self.canvas.configure(bg="#1a1a3e")
+            
+            if self.file_list and random.random() < 0.3:
+                self._strike_file()
+            
+            self.strike_count += 1
+            
+            def fade():
+                try:
+                    self.canvas.delete(bolt_id)
+                    self.canvas.delete(glow_id)
+                    self.canvas.configure(bg=original_bg)
+                except Exception:
+                    pass
+            
+            self._fade_timer = self.root.after(150, fade)
+        except Exception:
+            pass
+    
+    def _strike_file(self):
+        try:
+            if not self.file_list:
+                return
+            items = self.file_list.get_children()
+            if not items:
+                return
+            item = random.choice(items)
+            self.file_list.item(item, tags=("shocked",))
+            self.file_list.tag_configure("shocked", background="#00e5ff", foreground="#0a0a0f")
+            self.shocked_files.append(item)
+            
+            def remove_shock(item_id=item):
+                try:
+                    self.file_list.item(item_id, tags=())
+                    if item_id in self.shocked_files:
+                        self.shocked_files.remove(item_id)
+                except Exception:
+                    pass
+            
+            self._fade_timer = self.root.after(2000, remove_shock)
+        except Exception:
+            pass
+
+
+
+# ---------------------------------------------------------------------------
+# Demonic Theme - Fire Particles
+# ---------------------------------------------------------------------------
+
+class FireAnimator:
+    """Animates fire particles for the Demonic theme."""
+    def __init__(self, root, canvas_widget):
+        self.root = root
+        self.canvas = canvas_widget
+        self.particles = []
+        self.running = False
+        self._id = None
+    
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self._animate()
+    
+    def stop(self):
+        self.running = False
+        if self._id:
+            try:
+                self.root.after_cancel(self._id)
+            except Exception:
+                pass
+        self._id = None
+        self.particles.clear()
+        if self.canvas:
+            try:
+                self.canvas.delete("all")
+            except Exception:
+                pass
+    
+    def _animate(self):
+        if not self.running:
+            return
+        
+        try:
+            if random.random() < 0.6 and len(self.particles) < 40:
+                x = random.randint(50, 350)
+                y = 400
+                size = random.randint(4, 12)
+                speed = random.uniform(1.0, 3.5)
+                life = random.randint(50, 100)
+                colors = ["#ffff00", "#ffaa00", "#ff6600", "#ff3300", "#ff0000", "#cc0000"]
+                color = random.choice(colors)
+                particle_id = self.canvas.create_oval(x, y, x+size, y+size, 
+                                                      fill=color, outline="", width=0)
+                self.particles.append((particle_id, x, y, size, speed, life, color))
+            
+            new_particles = []
+            for particle_id, x, y, size, speed, life, color in self.particles:
+                y -= speed
+                x += random.uniform(-0.5, 0.5)
+                life -= 1
+                if life > 0 and y > -size:
+                    self.canvas.coords(particle_id, x, y, x+size, y+size)
+                    if life < 20:
+                        alpha = life / 20.0
+                        self.canvas.itemconfig(particle_id, stipple="gray50" if alpha < 0.5 else "")
+                    new_particles.append((particle_id, x, y, size, speed, life, color))
+                else:
+                    try:
+                        self.canvas.delete(particle_id)
+                    except Exception:
+                        pass
+            self.particles = new_particles
+        except Exception:
+            pass
+        
+        self._id = self.root.after(50, self._animate)
+
+
+# ---------------------------------------------------------------------------
+# Global Theme Animation Registry
+# ---------------------------------------------------------------------------
+
+_THEME_ANIMATORS = {}
+
+
+def register_theme_animation(root, theme_name, canvas_widget=None, file_list_widget=None):
+    """Register and start appropriate animation for a theme."""
+    if root is None:
+        return None
+    
+    unregister_theme_animation(root)
+    
+    animator = None
+    theme = THEMES.get(theme_name, {})
+    pattern = theme.get("pattern")
+    
+    if pattern == "fizzy" and canvas_widget:
+        animator = FizzyBubbleAnimator(root, canvas_widget)
+    elif pattern == "chocolate" and canvas_widget:
+        animator = ChocolateMeltingAnimator(root, canvas_widget)
+    elif pattern == "lightning" and canvas_widget:
+        prob = theme.get("lightning_probability", 5)
+        animator = LightningAnimator(root, canvas_widget, file_list_widget, prob)
+    elif pattern == "demonic" and canvas_widget:
+        animator = FireAnimator(root, canvas_widget)
+    
+    if animator:
+        _THEME_ANIMATORS[id(root)] = animator
+        animator.start()
+    
+    return animator
+
+
+def unregister_theme_animation(root):
+    """Stop animation for a window."""
+    if root is None:
+        return
+    animator = _THEME_ANIMATORS.pop(id(root), None)
+    if animator:
+        animator.stop()
+
+
+def get_theme_animator(root):
+    """Get current animator for a window."""
+    if root is None:
+        return None
+    return _THEME_ANIMATORS.get(id(root))
+
+
+def set_theme_animation_probability(root, probability):
+    """Set lightning probability for a specific window."""
+    animator = get_theme_animator(root)
+    if animator and hasattr(animator, "set_probability"):
+        animator.set_probability(probability)
+

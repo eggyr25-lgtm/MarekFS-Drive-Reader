@@ -6,6 +6,8 @@ that stores the PreferredPartitionID."""
 import os
 import sys
 import time
+import tempfile
+import shutil
 import struct
 import threading
 import subprocess
@@ -24,14 +26,16 @@ from marekfs_core import (
     SECTOR_SIZE, FILENAME_MAX_LEN, DIRECTORY_ENTRY_SIZE,
     JOURNAL_START_SECTOR, JOURNAL_MAGIC, ARCHIVE_MAGIC,
     MAX_JOURNAL_PAYLOAD_SIZE, JOURNAL_HEADER_SIZE, JOURNAL_SECTORS,
-    MAX_FILE_COUNT, THEORETICAL_MAX_FILES_64BIT, DEFAULT_DIR_SECTORS_COUNT,
+    MAX_FILE_COUNT, DEFAULT_DIR_SECTORS_COUNT,
     DEFAULT_DIR_START_SECTOR, DEFAULT_DATA_AREA_RESERVE, MAX_LOGICAL_FILENAME_CHARS,
     CACHE_MAX_SIZE, CACHE_MAGIC, CACHE_HEADER_SIZE, CACHE_START_SECTOR, CACHE_SECTORS,
+    CACHE_DISK_FRACTION, cache_size_for_disk, partition_cache_region, get_drive_size,
+    get_drive_size_bytes, is_marekfs_disk,
     LOCKS_DIR, FILE_ATTR_HIDDEN, FILE_ATTR_READONLY, FILE_ATTR_SYSTEM,
     FILE_ATTR_ARCHIVE, FILE_ATTR_COMPRESSED, FILE_ATTR_ENCRYPTED, FILE_ATTR_DIRECTORY,
     IMAGE_EXTS, MOVIE_EXTS,
     MAX_PARTITIONS, PARTITION_ID_LEN, PARTITION_MAGIC, PARTITION_TABLE_SECTORS,
-    is_admin, get_attr_string, get_attr_icon, format_bytes,
+    is_admin, get_attr_string, get_attr_icon, format_bytes, get_available_drives,
     create_marekfs_archive, parse_marekfs_archive, create_marekvid,
     load_file_metadata, save_file_metadata, file_id_for_record, data_checksum,
     load_file_id_database, save_file_id_database,
@@ -43,14 +47,18 @@ from marekfs_core import (
     init_default_partitions,
     load_programdata_config, save_programdata_config,
     get_preferred_partition_id, set_preferred_partition_id,
-    get_extended_fs_support, set_extended_fs_support, ALL_EXTENDED_FS,
     PROGRAM_DATA_CONFIG_PATH, ensure_scanner_config, update_scanner_rules,
     check_clamav_update, CLAMAV_CHECK_INTERVAL_SECONDS,
+    get_extended_fs_support, set_extended_fs_support, ALL_EXTENDED_FS,
+)
+from marekfs_core import (
+    read_extended_filesystem, list_extended_fs_files, read_extended_fs_file,
 )
 from marekfs_theme import (
     THEMES, THEME_NAMES, apply_theme, rainbow_static_override,
     start_rainbow_animation, stop_rainbow_animation,
     register_rainbow_window, unregister_rainbow_window,
+    register_theme_animation, unregister_theme_animation,
 )
 from marekfs_views import (
     ModernMarekFSArchiveViewer, ModernMarekFSProperties, ModernMarekFSEditor,
@@ -58,7 +66,7 @@ from marekfs_views import (
     ScannerUpdateProgressWindow, ClamAVUpdateSettingsWindow,
 )
 from marekfs_dashboard import DashboardWindow
-from ui_custom import AddPartitionDialog, WallpaperManager, minimize_to_corner
+from ui_custom import AddPartitionDialog, WallpaperManager, minimize_to_corner, theme_existing_window
 from marekfs_core import crypt_partition, is_partition_encrypted
 from marekfs_background import AnimatedBackground
 from marekfs_media import (
@@ -78,6 +86,10 @@ from marekfs_sharing import (
 )
 from marekfs_camera import CameraWindow
 from marekfs_snapshots import SnapshotWindow
+from marekfs_diskinfo import get_disk_info, format_disk_info
+from marekfs_views import _locate_executable
+from ui_custom import privileged_execute_confirm
+import atexit
 
 
 def auto_install_dependencies():
@@ -98,9 +110,11 @@ auto_install_dependencies()
 class ModernMarekFSApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("🚀 MAREKFS Exbibyte — Sector-Aligned Journaled Engine")
+        self.root.title("🚀 MAREKFS — Experimental Sector-Aligned Journaled Filesystem")
         self.root.geometry("1400x940")
         self.root.report_callback_exception = self.show_tkinter_error
+        
+        # Show safety warning on first run
         self.root.bind("<Map>", self._restore_window_decoration)
         self.scanner_config = ensure_scanner_config()
 
@@ -108,6 +122,8 @@ class ModernMarekFSApp:
         # and explicitly confirmed by the user before any advanced operation.
         self.drive_path = "\\\\.\\PhysicalDrive1"
         self._physical_drive_confirmed = False
+        # Don't auto-show disk info on every startup; opt-in via settings
+        self._auto_show_disk_info = False
 
         self.files_data = []
         self.file_metadata = load_file_metadata(self.drive_path)
@@ -125,14 +141,33 @@ class ModernMarekFSApp:
         self.next_free_sector = DEFAULT_DIR_START_SECTOR + self.dir_sectors_count
         self.status_var = tk.StringVar(value="Ready")
         self._download_import_state = self._load_download_import_state()
-        threading.Thread(target=self._initialise_scanner_rules, daemon=True).start()
+        # Defer starting background threads until the Tk mainloop is running.
+        # Scheduling the thread start via `root.after` avoids calling
+        # `root.after` from a background thread (which fails when the main
+        # loop isn't active yet).
+        try:
+            self.root.after(100, lambda: threading.Thread(target=self._initialise_scanner_rules, daemon=True).start())
+            self.root.after(200, lambda: self._start_clamav_checker())
+        except Exception:
+            # If scheduling fails (very unusual), fall back to starting them
+            # immediately but guarded inside the functions.
+            try:
+                threading.Thread(target=self._initialise_scanner_rules, daemon=True).start()
+            except Exception:
+                pass
+            try:
+                self._start_clamav_checker()
+            except Exception:
+                pass
         self._clamav_prompt_open = False
-        self._start_clamav_checker()
         self.show_hidden = tk.BooleanVar(value=True)
 
         self.cache_blown = True
         self.cache_advanced = tk.BooleanVar(value=False)
         self.held_locks = set()
+        self.disk_size_bytes = None  # total byte size of the current drive/image
+        self._extended_fs = None  # current extended filesystem parser, if any
+        self._extended_fs_name = None  # name of detected extended filesystem
 
         # --- Partitions ---
         self.partitions = []
@@ -166,6 +201,12 @@ class ModernMarekFSApp:
         self._update_ram_cache_status()
         self._schedule_download_import()
 
+        # Ensure any lock files we created are cleaned up when the app exits
+        try:
+            atexit.register(self._cleanup_locks_on_exit)
+        except Exception:
+            pass
+
     def _initialise_scanner_rules(self):
         try:
             results = update_scanner_rules(self.scanner_config)
@@ -173,6 +214,42 @@ class ModernMarekFSApp:
             self.root.after(0, lambda: self.status_var.set(f"Scanner ready · {updated} rule source(s) updated"))
         except Exception as e:
             self.root.after(0, lambda: self.status_var.set(f"Scanner ready · offline rules ({e})"))
+
+    def _cleanup_locks_on_exit(self):
+        # Remove any lock files that belong to this process PID, and
+        # release any held locks tracked in-memory.
+        try:
+            pid = os.getpid()
+            # release held locks first
+            try:
+                for full in list(getattr(self, 'held_locks', []) or []):
+                    try:
+                        self._release_lock(full)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Remove any lock files under LOCKS_DIR that contain our PID
+            try:
+                if os.path.isdir(LOCKS_DIR):
+                    for fname in os.listdir(LOCKS_DIR):
+                        p = os.path.join(LOCKS_DIR, fname)
+                        try:
+                            with open(p, 'r') as f:
+                                content = f.read().strip()
+                            if content and int(content) == pid:
+                                try: os.remove(p)
+                                except Exception: pass
+                        except Exception:
+                            try:
+                                # if cannot read, attempt to remove as stale
+                                os.remove(p)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     # --- ClamAV database auto-updater ---------------------------------------
     def _start_clamav_checker(self):
@@ -278,6 +355,25 @@ class ModernMarekFSApp:
         err_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         messagebox.showerror("Error Encountered", f"An unexpected error occurred:\n\n{err_msg}")
 
+    def _create_tooltip(self, widget, text):
+        """Create a simple tooltip for a widget."""
+        def show_tooltip(event):
+            tooltip = tk.Toplevel(widget)
+            tooltip.wm_overrideredirect(True)
+            tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+            label = ttk.Label(tooltip, text=text, background="#ffffe0", 
+                            relief="solid", borderwidth=1, padding=5)
+            label.pack()
+            widget._tooltip = tooltip
+        
+        def hide_tooltip(event):
+            if hasattr(widget, '_tooltip'):
+                widget._tooltip.destroy()
+                del widget._tooltip
+        
+        widget.bind("<Enter>", show_tooltip)
+        widget.bind("<Leave>", hide_tooltip)
+
     def _setup_custom_window(self):
         """Remove native title bar for a frameless, modern look."""
         self.root.overrideredirect(True)
@@ -294,6 +390,10 @@ class ModernMarekFSApp:
         """
         name = self.theme_var.get()
         t = apply_theme(self.root, name)
+        
+        # Stop all theme-specific animations before switching
+        unregister_theme_animation(self.root)
+        
         if t.get("rainbow"):
             override = rainbow_static_override(t)
             t = apply_theme(self.root, name, override=override)
@@ -324,6 +424,12 @@ class ModernMarekFSApp:
                 self.btn_close.configure(bg=surface, fg=fg)
             except Exception:
                 pass
+        
+        # Register and start theme-specific animations (fizzy, chocolate, lightning, demonic)
+        canvas_widget = getattr(self, "wallpaper_canvas", None)
+        file_list_widget = getattr(self, "tree", None)
+        register_theme_animation(self.root, name, canvas_widget, file_list_widget)
+        
         try:
             self.wallpaper_canvas.configure(bg=t.get("bg", "#10131c"))
         except Exception:
@@ -427,7 +533,7 @@ class ModernMarekFSApp:
         accent = t.get("accent", "#00d2ff")
         self.title_bar = tk.Frame(self.root, bg=surface, height=38)
         self.title_bar.pack(fill=tk.X)
-        self.title_label = tk.Label(self.title_bar, text="  🚀 MAREKFS Exbibyte — Sector-Aligned Journaled Engine",
+        self.title_label = tk.Label(self.title_bar, text="  🚀 MAREKFS — Experimental Sector-Aligned Journaled Filesystem",
                                     bg=surface, fg=fg, font=("Segoe UI", 10, "bold"))
         self.title_label.pack(side=tk.LEFT, padx=14)
         self.btn_close = tk.Label(self.title_bar, text="  ✕", bg=surface, fg=fg,
@@ -481,11 +587,27 @@ class ModernMarekFSApp:
         ttk.Label(header, text="🚀 MAREKFS", style="Title.TLabel").pack(side=tk.LEFT, padx=14, pady=6)
 
         drive_frame = ttk.Frame(header); drive_frame.pack(side=tk.RIGHT, padx=14, pady=6)
+        
+        # Drive selector dropdown
+        self.drive_combo = ttk.Combobox(drive_frame, state="readonly", width=30)
+        self.drive_combo['values'] = [d[0] for d in get_available_drives()]
+        if self.drive_combo['values']:
+            self.drive_combo.current(0)
+        self.drive_combo.pack(side=tk.LEFT, padx=5)
+        self.drive_combo.bind("<<ComboboxSelected>>", self._on_drive_selected)
+        
+        # Manual path entry (for advanced users)
         self.path_var = tk.StringVar(value=self.drive_path)
-        ttk.Entry(drive_frame, textvariable=self.path_var, width=20).pack(side=tk.LEFT, padx=5)
-        ttk.Button(drive_frame, text="🔄 Reload", command=self.scan_drive).pack(side=tk.LEFT, padx=2)
-        ttk.Button(drive_frame, text="🔍 Salvage", command=self.salvage_journal_data).pack(side=tk.LEFT, padx=2)
-        ttk.Button(drive_frame, text="🧹 Format", command=self.format_disk).pack(side=tk.LEFT, padx=2)
+        path_entry = ttk.Entry(drive_frame, textvariable=self.path_var, width=18)
+        path_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Add tooltip for drive path format
+        self._create_tooltip(path_entry, "Type C:\\\\ or D:\\\\ or \\\\.\\PhysicalDrive1")
+        
+        ttk.Button(drive_frame, text="🔄", command=self.scan_drive, width=3).pack(side=tk.LEFT, padx=2)
+        ttk.Button(drive_frame, text="🔍", command=self.salvage_journal_data, width=3).pack(side=tk.LEFT, padx=2)
+        ttk.Button(drive_frame, text="🧹", command=self.format_disk, width=3).pack(side=tk.LEFT, padx=2)
+        ttk.Button(drive_frame, text="ℹ️", command=self.show_disk_info, width=3).pack(side=tk.LEFT, padx=2)
 
         theme_frame = ttk.Frame(self.root, padding=4); theme_frame.pack(fill=tk.X, padx=10)
         ttk.Label(theme_frame, text="Theme:").pack(side=tk.LEFT, padx=5)
@@ -495,7 +617,7 @@ class ModernMarekFSApp:
         ttk.Button(theme_frame, text="🗄️ Dashboard", style="Accent.TButton", command=self.open_dashboard).pack(side=tk.LEFT, padx=12)
         ttk.Button(theme_frame, text="🖼️ Set Wallpaper", command=self.set_wallpaper).pack(side=tk.LEFT, padx=4)
         ttk.Button(theme_frame, text="🚫 Clear Wallpaper", command=self.clear_wallpaper).pack(side=tk.LEFT, padx=4)
-        ttk.Label(theme_frame, text=f"Max entries: {THEORETICAL_MAX_FILES_64BIT:,} (64-bit)").pack(side=tk.LEFT, padx=12)
+        ttk.Label(theme_frame, text=f"Max entries: {MAX_FILE_COUNT:,}").pack(side=tk.LEFT, padx=12)
 
         # --- Partition selector bar ---
         part_frame = ttk.Frame(self.root, padding=4); part_frame.pack(fill=tk.X, padx=10)
@@ -566,6 +688,12 @@ class ModernMarekFSApp:
         self.context_menu.add_command(label="🌍 Translate name & content", command=self.open_translator)
         self.context_menu.add_command(label="🔍 Search by FileID", command=self.search_selected_file_id)
         self.context_menu.add_command(label="📡 Send via Bluetooth", command=self.open_bluetooth_share)
+        self.context_menu.add_command(label="✏️ Rename", command=self.rename_selected_file)
+        # Execute submenu: run in VM (sandbox) or run in Privileged mode (dangerous)
+        exec_menu = tk.Menu(self.context_menu, tearoff=0)
+        exec_menu.add_command(label="Run (VM)", command=lambda: self.execute_selected_file(vm=True))
+        exec_menu.add_command(label="Privileged Execute", command=lambda: self.execute_selected_file(vm=False))
+        self.context_menu.add_cascade(label="⚙️ Execute", menu=exec_menu)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="🗑️ Delete Item", command=self.delete_file)
         self.tree.bind("<Button-3>", self.show_context_menu)
@@ -626,6 +754,153 @@ class ModernMarekFSApp:
             self.tree.selection_set(item)
             try: self.context_menu.tk_popup(event.x_root, event.y_root)
             finally: self.context_menu.grab_release()
+
+    def execute_selected_file(self, vm=True):
+        sel = self.tree.selection()
+        if not sel: return
+        values = self.tree.item(sel[0])['values']
+        rel_name = values[1] if len(values) > 1 else values[0]
+        full_path = f"{self.current_folder}/{rel_name}" if self.current_folder else rel_name
+        record = next((r for r in self.files_data if r.get('filename') == full_path), None)
+        if not record:
+            messagebox.showerror("Execute Failed", "Selected file not found.")
+            return
+        if record.get('is_dir'):
+            messagebox.showinfo("Execute", "Cannot execute a directory.")
+            return
+        # Privileged execute confirmation
+        if not vm:
+            ok = privileged_execute_confirm(self.root)
+            if not ok:
+                return
+
+        # Export MarekFS into a sandbox root
+        tmpdir = tempfile.mkdtemp(prefix="marekfs_exec_")
+        export_root = os.path.join(tmpdir, "marekfs")
+        try:
+            os.makedirs(export_root, exist_ok=True)
+            # export all files so relative includes work
+            for rec in getattr(self, 'files_data', []) or []:
+                fname = rec.get('filename')
+                if not fname: continue
+                outpath = os.path.join(export_root, *fname.split('/'))
+                d = os.path.dirname(outpath)
+                if d and not os.path.exists(d):
+                    os.makedirs(d, exist_ok=True)
+                if not rec.get('is_dir'):
+                    try:
+                        data = self._read_file_bytes(rec, "")
+                        with open(outpath, 'wb') as of:
+                            of.write(data or b"")
+                    except Exception:
+                        pass
+
+            # Write the selected record to ensure it's present
+            sel_path = os.path.join(export_root, *full_path.split('/'))
+            sel_dir = os.path.dirname(sel_path)
+            if sel_dir and not os.path.exists(sel_dir):
+                os.makedirs(sel_dir, exist_ok=True)
+            try:
+                with open(sel_path, 'wb') as sf:
+                    sf.write(self._read_file_bytes(record, "") or b"")
+            except Exception:
+                pass
+
+            env = os.environ.copy()
+            env['MAREKFS_ROOT'] = export_root
+
+            # Decide how to run based on extension
+            ext = os.path.splitext(record['filename'])[1].lower()
+            # Executable directly
+            if ext == '.exe':
+                exe_path = sel_path
+                cwd = export_root if vm else None
+                subprocess.run([exe_path], cwd=cwd, env=env)
+            elif ext in ('.c', '.cpp', '.cc'):
+                # compile into sandbox and run
+                src = sel_path
+                exe = os.path.join(export_root, 'prog.exe')
+                if ext == '.c':
+                    comp_list = [("gcc", ["gcc", src, "-o", exe]), ("cc", ["cc", src, "-o", exe]), ("clang", ["clang", src, "-o", exe]), ("tcc", ["tcc", "-o", exe, src])]
+                else:
+                    comp_list = [("g++", ["g++", src, "-o", exe]), ("clang++", ["clang++", src, "-o", exe])]
+                found = False
+                for name, cmd in comp_list:
+                    path = _locate_executable(cmd[0])
+                    if path:
+                        cmd0 = list(cmd)
+                        cmd0[0] = path
+                        subprocess.run(cmd0, cwd=export_root, env=env)
+                        found = True
+                        break
+                if not found:
+                    messagebox.showerror("Compile Failed", "No compiler found for source file.")
+                else:
+                    if os.path.exists(exe):
+                        subprocess.run([exe], cwd=export_root if vm else None, env=env)
+            elif ext == '.py':
+                # run with python, using preamble when vm=True
+                script = sel_path
+                if vm:
+                    # prepend a small preamble file that maps open -> MAREKFS_ROOT
+                    runner = os.path.join(tmpdir, 'run_python_vm.py')
+                    preamble = (
+                        'import os, builtins\n'
+                        'MAREKFS_ROOT = os.environ.get("MAREKFS_ROOT")\n'
+                        'def _translate(p):\n'
+                        '    if p is None: return p\n'
+                        '    p = str(p)\n'
+                        '    if os.path.isabs(p) or (len(p)>1 and p[1:2]==":"):\n'
+                        '        rel = p.replace(":","" ).lstrip('"\\/"')\n'
+                        '        return os.path.join(MAREKFS_ROOT, *rel.split("\\\\" if "\\\\" in rel else "/"))\n'
+                        '    return os.path.join(MAREKFS_ROOT, p)\n'
+                        'import builtins as _b\n'
+                        '_orig_open = _b.open\n'
+                        'def open(path, mode="r", *a, **kw):\n'
+                        '    return _orig_open(_translate(path), mode, *a, **kw)\n'
+                        '_b.open = open\n'
+                        f'exec(compile(open(r"{script}").read(), r"{script}", "exec"), globals())\n'
+                    )
+                    try:
+                        with open(runner, 'w', encoding='utf-8') as rf:
+                            rf.write(preamble)
+                        subprocess.run([sys.executable, runner], cwd=export_root, env=env)
+                    except Exception as e:
+                        messagebox.showerror("Run Failed", str(e))
+                else:
+                    subprocess.run([sys.executable, script], env=env)
+            else:
+                messagebox.showinfo("Execute", f"No execution handler for '{ext}' files.")
+
+        finally:
+            try:
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def rename_selected_file(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        values = self.tree.item(sel[0])['values']
+        rel_name = values[1] if len(values) > 1 else values[0]
+        full_path = f"{self.current_folder}/{rel_name}" if self.current_folder else rel_name
+        # Ask for new name (allow path components)
+        new_name = simpledialog.askstring("Rename", f"Enter new name for '{rel_name}':", initialvalue=rel_name, parent=self.root)
+        if not new_name:
+            return
+        # If user provided a relative path, resolve against current folder
+        if '/' in new_name or '\\' in new_name:
+            # normalize separators to forward slash
+            new_full = new_name.replace('\\', '/').lstrip('/')
+        else:
+            new_full = f"{self.current_folder}/{new_name}" if self.current_folder else new_name
+        # Ensure not colliding
+        if any(i['filename'] == new_full for i in self.files_data):
+            messagebox.showwarning("Rename", f"'{new_full}' already exists.")
+            return
+        # Call existing rename_entry
+        self.rename_entry(full_path, new_full)
 
     # --- Partitions ------------------------------------------------------
     def load_partitions(self):
@@ -834,14 +1109,25 @@ class ModernMarekFSApp:
         elif self.cache_advanced.get(): self.cache_status_var.set("Cache: RWX (ADVANCED) 🟢")
         else: self.cache_status_var.set("Cache: read-only 🟡")
 
+    def _active_cache_region(self):
+        """Return (cache_start_sector, cache_sectors, cache_max_size) for the
+        currently active partition, so the cache is partition-specific and sized
+        to up to 25% of the disk. Falls back to the legacy global layout when
+        there is no active partition (e.g. an unpartitioned disk)."""
+        if self.partitions and 0 <= self.active_partition_index < len(self.partitions):
+            total = self.disk_size_bytes or 0
+            return partition_cache_region(self.partitions[self.active_partition_index], total)
+        return CACHE_START_SECTOR, CACHE_SECTORS, CACHE_MAX_SIZE
+
     def blow_cache(self):
         if not messagebox.askyesno("Blow Cache", "Simulate power loss to the cache?\nThe cache will be marked BLOWN. Raw bytes remain until overwritten."):
             return
         try:
+            cache_start, _, _ = self._active_cache_region()
             fd = open_drive(self.drive_path, read_write=True)
             try:
                 hdr = CACHE_MAGIC + (0).to_bytes(8, "little") + b"\x00"
-                write_sectors(fd, CACHE_START_SECTOR, hdr.ljust(SECTOR_SIZE, b"\x00"))
+                write_sectors(fd, cache_start, hdr.ljust(SECTOR_SIZE, b"\x00"))
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -854,13 +1140,14 @@ class ModernMarekFSApp:
     def cache_write(self, data: bytes):
         if not self.cache_advanced.get():
             raise PermissionError("Cache is read-only for normal users. Enable 'Cache editing (ADVANCED)' for RWX.")
-        if len(data) > CACHE_MAX_SIZE:
-            raise ValueError(f"Cache cap is {format_bytes(CACHE_MAX_SIZE)}; payload is {format_bytes(len(data))}.")
+        cache_start, _, cache_max = self._active_cache_region()
+        if len(data) > cache_max:
+            raise ValueError(f"Cache cap is {format_bytes(cache_max)}; payload is {format_bytes(len(data))}.")
         fd = open_drive(self.drive_path, read_write=True)
         try:
-            write_sectors(fd, CACHE_START_SECTOR + 1, data)
+            write_sectors(fd, cache_start + 1, data)
             hdr = CACHE_MAGIC + len(data).to_bytes(8, "little") + b"\x01"
-            write_sectors(fd, CACHE_START_SECTOR, hdr.ljust(SECTOR_SIZE, b"\x00"))
+            write_sectors(fd, cache_start, hdr.ljust(SECTOR_SIZE, b"\x00"))
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -869,17 +1156,18 @@ class ModernMarekFSApp:
 
     def cache_read(self):
         if self.cache_blown: return None
+        cache_start, _, cache_max = self._active_cache_region()
         fd = open_drive(self.drive_path, read_write=False)
         try:
-            hdr = read_sectors(fd, CACHE_START_SECTOR, 1)
+            hdr = read_sectors(fd, cache_start, 1)
             if not hdr.startswith(CACHE_MAGIC):
                 self.cache_blown = True; self._update_cache_status(); return None
             size = int.from_bytes(hdr[len(CACHE_MAGIC):len(CACHE_MAGIC)+8], "little")
             valid = hdr[len(CACHE_MAGIC)+8]
-            if not valid or size <= 0 or size > CACHE_MAX_SIZE:
+            if not valid or size <= 0 or size > cache_max:
                 self.cache_blown = True; self._update_cache_status(); return None
             sectors = (size + SECTOR_SIZE - 1) // SECTOR_SIZE
-            return read_sectors(fd, CACHE_START_SECTOR + 1, sectors)[:size]
+            return read_sectors(fd, cache_start + 1, sectors)[:size]
         finally:
             os.close(fd)
 
@@ -950,9 +1238,70 @@ class ModernMarekFSApp:
             self.root.after(0, self.scan_drive)
         threading.Thread(target=work, daemon=True).start()
 
+    # --- Disk Info --------------------------------------------------------
+    def show_disk_info(self):
+        """Show disk information: type, sub-type, speed, and NVMe slot info."""
+        drive_path = self.path_var.get().strip()
+        if not drive_path:
+            messagebox.showinfo("Disk Info", "Select a disk first.")
+            return
+
+        win = tk.Toplevel(self.root)
+        # Apply the app's custom theme to this dialog
+        try:
+            theme_existing_window(win, parent=self.root, title="💽 Disk Info", min_size=(520, 420))
+        except Exception:
+            try:
+                win.title("💽 Disk Info")
+                win.geometry("520x420")
+                win.resizable(True, True)
+                win.transient(self.root)
+            except Exception:
+                pass
+
+        txt = tk.Text(win, font=("Consolas", 10), bg="#0d1117", fg="#c9d1d9",
+                       wrap=tk.WORD, padx=10, pady=10)
+        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        txt.insert(tk.END, "Scanning disk... please wait.\n")
+        txt.config(state=tk.DISABLED)
+        win.update()
+
+        def work():
+            try:
+                info = get_disk_info(drive_path)
+                text = format_disk_info(info)
+            except Exception as e:
+                text = "Error: {}".format(e)
+            # Append the last DiskTest summary if available on the app
+            try:
+                summary = getattr(self, 'last_disk_test_summary', None)
+                if summary:
+                    text = text + "\n\nDiskTest Summary:\n" + summary
+            except Exception:
+                pass
+
+            def show():
+                txt.config(state=tk.NORMAL)
+                txt.delete("1.0", tk.END)
+                txt.insert(tk.END, text)
+                txt.config(state=tk.DISABLED)
+            self.root.after(0, show)
+
+        threading.Thread(target=work, daemon=True).start()
+
     # --- DiskTest -------------------------------------------------------
     def run_disk_test(self):
-        win = DiskTestWindow(self.root)
+        # Pass a callback so the DiskTestWindow returns a summary when finished.
+        def _disk_test_done(summary_text):
+            try:
+                # Store summary for later display in Disk Info
+                self.last_disk_test_summary = summary_text
+                # Update status briefly
+                self.status_var.set(f"DiskTest complete · {summary_text}")
+            except Exception:
+                pass
+
+        win = DiskTestWindow(self.root, on_finished=_disk_test_done)
         duration = win.duration_min.get() * 60
         chunk_size = 32 * 1024 * 1024
         block = bytes((i * 2654435761) & 0xff for i in range(256)) * (chunk_size // 256)
@@ -967,8 +1316,9 @@ class ModernMarekFSApp:
                 self.root.after(0, lambda: messagebox.showerror("DiskTest", f"Cannot open drive: {e}"))
                 return
             try:
-                write_target = CACHE_START_SECTOR + 1
-                buf = test_data[:min(chunk_size, CACHE_MAX_SIZE)]
+                cache_start, _, cache_max = self._active_cache_region()
+                write_target = cache_start + 1
+                buf = test_data[:min(chunk_size, cache_max)]
                 while not stop_evt.is_set() and (time.time() - t_start) < duration:
                     w0 = time.time()
                     try:
@@ -1000,20 +1350,26 @@ class ModernMarekFSApp:
         try:
             fd = open_drive(self.drive_path, read_write=True)
             try:
-                # Initialize a default partition table with 4 partitions.
-                self.partitions = init_default_partitions(4)
+                disk_size = get_drive_size_bytes(self.drive_path)
+                self.disk_size_bytes = disk_size
+                # Single default partition sized to the MAXIMUM for this disk
+                # (not a fixed 1 GB reserve), so both the journal and this
+                # partition's cache have room to work.
+                self.partitions = init_default_partitions(1, disk_size)
                 write_partition_table(fd, self.partitions, 0)
                 empty_dir = b"\x00" * (self.dir_sectors_count * SECTOR_SIZE)
                 write_sectors(fd, DEFAULT_DIR_START_SECTOR, empty_dir)
+                # Partition-specific cache header at the high end of the partition.
+                cache_start, _, _ = partition_cache_region(self.partitions[0], disk_size)
                 hdr = CACHE_MAGIC + (0).to_bytes(8, "little") + b"\x00"
-                write_sectors(fd, CACHE_START_SECTOR, hdr.ljust(SECTOR_SIZE, b"\x00"))
+                write_sectors(fd, cache_start, hdr.ljust(SECTOR_SIZE, b"\x00"))
             finally:
                 os.close(fd)
             self.cache_blown = True; self._update_cache_status()
             self.active_partition_index = 0
             self._refresh_part_combo()
             self.scan_drive()
-            messagebox.showinfo("Formatted", "Disk formatted with 4 default partitions.")
+            messagebox.showinfo("Formatted", "Disk formatted with 1 default partition.")
         except Exception as e:
             messagebox.showerror("Format Error", str(e))
 
@@ -1034,15 +1390,17 @@ class ModernMarekFSApp:
                         full_raw = read_sectors(fd, JOURNAL_START_SECTOR, total_sectors)
                         payload = full_raw[JOURNAL_HEADER_SIZE:JOURNAL_HEADER_SIZE + d_len]
                         target_sec = t_sec if t_sec >= DEFAULT_DIR_START_SECTOR else self.next_free_sector
-                        rec_fname = "salvaged_file_1.txt"
-                        if payload.startswith(ARCHIVE_MAGIC):
-                            rec_fname = "salvaged_archive_1.MAREKARCHV"
+                        
+                        # Detect file type from content to preserve original extension
+                        rec_fname = self._detect_salvaged_filename(payload, target_sec)
+                        
                         already_present = any(f["sector"] == target_sec or f["filename"] == rec_fname for f in self.files_data)
                         if not already_present:
                             padded = payload.ljust(((len(payload) + SECTOR_SIZE - 1) // SECTOR_SIZE) * SECTOR_SIZE, b"\x00")
                             write_sectors(fd, target_sec, padded)
+                            is_archive = rec_fname.endswith(".MAREKARCHV")
                             self.files_data.append({"filename": rec_fname, "is_dir": False, "sector": target_sec,
-                                                    "size": len(payload), "attributes": FILE_ATTR_ARCHIVE if rec_fname.endswith(".MAREKARCHV") else 0, "encrypted": False})
+                                                    "size": len(payload), "attributes": FILE_ATTR_ARCHIVE if is_archive else 0, "encrypted": False})
                             salvaged_count += 1
                             sectors_needed = max(1, len(padded) // SECTOR_SIZE)
                             self.next_free_sector = max(self.next_free_sector, target_sec + sectors_needed)
@@ -1057,6 +1415,90 @@ class ModernMarekFSApp:
                 messagebox.showinfo("Salvage Result", "No recoverable file payload found in the journal region.")
         except Exception as e:
             messagebox.showerror("Salvage Error", str(e))
+    
+    def _detect_salvaged_filename(self, payload, target_sec):
+        """Detect file type from payload content and generate appropriate filename."""
+        # Check for MarekFS archive magic
+        if payload.startswith(ARCHIVE_MAGIC):
+            return f"salvaged_archive_{target_sec}.MAREKARCHV"
+        
+        # Try to detect file type from magic bytes
+        ext = ".bin"  # default
+        if len(payload) >= 4:
+            # PNG
+            if payload[:4] == b"\x89PNG":
+                ext = ".png"
+            # JPEG
+            elif payload[:3] == b"\xff\xd8\xff":
+                ext = ".jpg"
+            # GIF
+            elif payload[:6] in (b"GIF87a", b"GIF89a"):
+                ext = ".gif"
+            # BMP
+            elif payload[:2] == b"BM":
+                ext = ".bmp"
+            # PDF
+            elif payload[:4] == b"%PDF":
+                ext = ".pdf"
+            # ZIP (could be docx, xlsx, etc.)
+            elif payload[:4] == b"PK\x03\x04":
+                ext = ".zip"
+            # RAR
+            elif payload[:3] == b"Rar!":
+                ext = ".rar"
+            # 7z
+            elif payload[:6] == b"7z\xbc\xaf\x27\x1c":
+                ext = ".7z"
+            # MP4/MOV
+            elif payload[:4] in (b"\x00\x00\x00\x18ftypmp42", b"\x00\x00\x00\x18ftypisom", b"\x00\x00\x00\x18ftypM4V"):
+                ext = ".mp4"
+            # AVI
+            elif payload[:4] == b"RIFF" and payload[8:12] == b"AVI ":
+                ext = ".avi"
+            # MKV
+            elif payload[:4] == b"\x1a\x45\xdf\xa3":
+                ext = ".mkv"
+            # MP3
+            elif payload[:3] == b"ID3" or (len(payload) >= 2 and payload[:2] == b"\xff\xfb"):
+                ext = ".mp3"
+            # WAV
+            elif payload[:4] == b"RIFF" and payload[8:12] == b"WAVE":
+                ext = ".wav"
+            # OGG
+            elif payload[:4] == b"OggS":
+                ext = ".ogg"
+            # FLAC
+            elif payload[:4] == b"fLaC":
+                ext = ".flac"
+            # Text files - check if mostly printable ASCII
+            elif len(payload) > 20:
+                printable = sum(1 for b in payload[:min(512, len(payload))] if 32 <= b < 127 or b in (9, 10, 13))
+                if printable / min(512, len(payload)) > 0.9:
+                    ext = ".txt"
+            # EXE/DLL
+            elif payload[:2] == b"MZ":
+                ext = ".exe"
+            # ELF (Linux executables)
+            elif payload[:4] == b"\x7fELF":
+                ext = ".elf"
+        
+        return f"salvaged_file_{target_sec}{ext}"
+
+    def _on_drive_selected(self, event=None):
+        """Handle drive selection from dropdown."""
+        selected_display = self.drive_combo.get()
+        if not selected_display:
+            return
+        
+        # Find the corresponding path
+        drives = get_available_drives()
+        for display, path in drives:
+            if display == selected_display:
+                self.path_var.set(path)
+                self.drive_path = path
+                self._physical_drive_confirmed = False
+                self.scan_drive()
+                break
 
     def _ensure_drive_access(self, write=False):
         if self.drive_path.lower().startswith("\\\\.\\") and not self._physical_drive_confirmed:
@@ -1066,6 +1508,67 @@ class ModernMarekFSApp:
                 return False
             self._physical_drive_confirmed = True
         return True
+
+    def _detect_external_fs_name(self, boot_sector):
+        """
+        Detect filesystem type from boot sector.
+        Returns filesystem name or None.
+        """
+        try:
+            if len(boot_sector) < 90:
+                return None
+            # NTFS
+            if boot_sector[3:11] == b"NTFS    ":
+                return "NTFS"
+            # FAT32
+            if boot_sector[82:90] == b"FAT32   ":
+                return "FAT32"
+            # FAT16
+            if boot_sector[82:90] == b"FAT16   ":
+                return "FAT16"
+            # exFAT
+            if boot_sector[3:6] == b"EXF":
+                return "exFAT"
+            # EXT2/3/4
+            import struct
+            if len(boot_sector) >= 0x43A:
+                magic = struct.unpack("<H", boot_sector[0x438:0x43A])[0]
+                if magic == 0xEF53:
+                    # Check features to distinguish EXT version
+                    if len(boot_sector) >= 0x46C:
+                        ext4_feat = struct.unpack("<I", boot_sector[0x464:0x468])[0]
+                        if ext4_feat & 0x40:  # EXT4 feature
+                            return "EXT4"
+                    return "EXT3"
+            # HFS/HFS+
+            if boot_sector[0:2] in (b"H+", b"HX"):
+                return "HFS+"
+            if boot_sector[0:2] == b"BD":
+                return "HFS"
+            # APFS
+            if boot_sector[0:4] == b"NXSB":
+                return "APFS"
+            # BTRFS
+            if len(boot_sector) >= 0x68:
+                if boot_sector[0x60:0x68] == b"_BHRfS_M":
+                    return "BTRFS"
+            return None
+        except Exception:
+            return None
+
+    def _browse_extended_dir(self, fs_name, directory_path="/"):
+        """
+        Browse a directory in an extended filesystem.
+        """
+        try:
+            files, error = list_extended_fs_files(self.drive_path, fs_name, directory_path)
+            if error:
+                messagebox.showerror("Extended FS Error", error)
+                return []
+            return files
+        except Exception as e:
+            messagebox.showerror("Extended FS Error", str(e))
+            return []
 
     def scan_drive(self):
         new_drive_path = self.path_var.get().strip()
@@ -1081,46 +1584,91 @@ class ModernMarekFSApp:
         self.file_id_database = load_file_id_database()
         try:
             fd = open_drive(self.drive_path, read_write=True)
+            self.disk_size_bytes = get_drive_size_bytes(self.drive_path)
+            marekfs = is_marekfs_disk(fd)
             try:
-                recovery_replay_journal(fd)
-                os.lseek(fd, DEFAULT_DIR_START_SECTOR * SECTOR_SIZE, os.SEEK_SET)
-                dir_data = os.read(fd, self.dir_sectors_count * SECTOR_SIZE)
+                if marekfs:
+                    recovery_replay_journal(fd)
+                    os.lseek(fd, DEFAULT_DIR_START_SECTOR * SECTOR_SIZE, os.SEEK_SET)
+                    dir_data = os.read(fd, self.dir_sectors_count * SECTOR_SIZE)
+                else:
+                    dir_data = None
             finally:
                 os.close(fd)
-            max_sec = DEFAULT_DIR_START_SECTOR + self.dir_sectors_count
-            total_slots = len(dir_data) // DIRECTORY_ENTRY_SIZE
-            for i in range(total_slots):
-                off = i * DIRECTORY_ENTRY_SIZE
-                if off + DIRECTORY_ENTRY_SIZE > len(dir_data): break
-                entry = dir_data[off:off+DIRECTORY_ENTRY_SIZE]
-                name_len = struct.unpack("<H", entry[0:2])[0]
-                if name_len == 0 or name_len > FILENAME_MAX_LEN: continue
-                fname = entry[2:2+name_len].decode("utf-8", errors="ignore")
-                if not fname: continue
-                meta_offset = 2 + FILENAME_MAX_LEN
-                is_dir = entry[meta_offset]
-                sector = int.from_bytes(entry[meta_offset+1:meta_offset+9], "little")
-                size = int.from_bytes(entry[meta_offset+9:meta_offset+17], "little")
-                attributes = entry[meta_offset+17] if len(entry) > meta_offset+17 else 0
-                if is_dir: attributes |= FILE_ATTR_DIRECTORY
-                is_encrypted = bool(attributes & FILE_ATTR_ENCRYPTED)
-                if sector > 0:
-                    prior = next((value for value in self.file_id_database.values() if value.get("name") == fname or int(value.get("sector", -1)) == sector), None)
-                    file_id = int(prior.get("file_id")) if prior and 0 <= int(prior.get("file_id")) <= ((1 << 64) - 1) else sector
-                    logical_name = prior.get("name", fname) if prior and len(str(prior.get("name", fname))) <= MAX_LOGICAL_FILENAME_CHARS else fname
-                    record = {"filename": logical_name, "is_dir": bool(is_dir), "sector": sector,
-                              "file_id": file_id, "size": size, "attributes": attributes,
-                              "attributes_text": get_attr_string(attributes), "encrypted": is_encrypted}
-                    self.files_data.append(record)
-                    self.file_id_database[str(file_id)] = {"file_id": file_id, "name": logical_name, "sector": sector, "updated": time.time()}
-                    logical_size = size + (44 if attributes & FILE_ATTR_ENCRYPTED else 0)
-                    sectors_used = max(1, (logical_size + SECTOR_SIZE - 1) // SECTOR_SIZE)
-                    max_sec = max(max_sec, sector + sectors_used)
-            self.next_free_sector = max_sec + 1
-            save_file_id_database(self.file_id_database)
-            self._update_cache_status()
-            self.render_tree()
-            self._restart_wifi_server()
+
+            if marekfs:
+                # Existing MarekFS logic
+                max_sec = DEFAULT_DIR_START_SECTOR + self.dir_sectors_count
+                total_slots = len(dir_data) // DIRECTORY_ENTRY_SIZE
+                for i in range(total_slots):
+                    off = i * DIRECTORY_ENTRY_SIZE
+                    if off + DIRECTORY_ENTRY_SIZE > len(dir_data): break
+                    entry = dir_data[off:off+DIRECTORY_ENTRY_SIZE]
+                    name_len = struct.unpack("<H", entry[0:2])[0]
+                    if name_len == 0 or name_len > FILENAME_MAX_LEN: continue
+                    fname = entry[2:2+name_len].decode("utf-8", errors="ignore")
+                    if not fname: continue
+                    meta_offset = 2 + FILENAME_MAX_LEN
+                    is_dir = entry[meta_offset]
+                    sector = int.from_bytes(entry[meta_offset+1:meta_offset+9], "little")
+                    size = int.from_bytes(entry[meta_offset+9:meta_offset+17], "little")
+                    attributes = entry[meta_offset+17] if len(entry) > meta_offset+17 else 0
+                    if is_dir: attributes |= FILE_ATTR_DIRECTORY
+                    is_encrypted = bool(attributes & FILE_ATTR_ENCRYPTED)
+                    if sector > 0:
+                        prior = next((value for value in self.file_id_database.values() if value.get("name") == fname or int(value.get("sector", -1)) == sector), None)
+                        file_id = int(prior.get("file_id")) if prior and 0 <= int(prior.get("file_id")) <= ((1 << 64) - 1) else sector
+                        logical_name = prior.get("name", fname) if prior and len(str(prior.get("name", fname))) <= MAX_LOGICAL_FILENAME_CHARS else fname
+                        record = {"filename": logical_name, "is_dir": bool(is_dir), "sector": sector,
+                                  "file_id": file_id, "size": size, "attributes": attributes,
+                                  "attributes_text": get_attr_string(attributes), "encrypted": is_encrypted}
+                        self.files_data.append(record)
+                        self.file_id_database[str(file_id)] = {"file_id": file_id, "name": logical_name, "sector": sector, "updated": time.time()}
+                        logical_size = size + (44 if attributes & FILE_ATTR_ENCRYPTED else 0)
+                        sectors_used = max(1, (logical_size + SECTOR_SIZE - 1) // SECTOR_SIZE)
+                        max_sec = max(max_sec, sector + sectors_used)
+                self.next_free_sector = max_sec + 1
+                save_file_id_database(self.file_id_database)
+                self._update_cache_status()
+                self.render_tree()
+                self._restart_wifi_server()
+                if getattr(self, '_auto_show_disk_info', False):
+                    self.root.after(200, self.show_disk_info)
+            else:
+                # Try extended filesystem
+                boot_sector = read_sectors(self.drive_path, 0, 1)
+                fs_name = self._detect_external_fs_name(boot_sector)
+                if fs_name and fs_name in get_extended_fs_support():
+                    self._extended_fs_name = fs_name
+                    parser, error = read_extended_filesystem(self.drive_path, fs_name)
+                    if parser and not error:
+                        self._extended_fs = parser
+                        files, error = list_extended_fs_files(self.drive_path, fs_name, "/")
+                        if error:
+                            messagebox.showwarning("Extended FS Error", error)
+                        else:
+                            self.files_data = []
+                            for f in files:
+                                self.files_data.append({
+                                    "filename": f.get("path", "/" + f.get("name", "")),
+                                    "is_dir": f.get("file_type") == "directory",
+                                    "sector": 0,
+                                    "file_id": 0,
+                                    "size": f.get("size", 0),
+                                    "attributes": 0,
+                                    "attributes_text": "Extended FS",
+                                    "encrypted": False,
+                                })
+                            self._update_cache_status()
+                            self.render_tree()
+                            self.status_var.set(f"Disk: '{self.drive_path}' | Extended FS: {fs_name} | Items: {len(files)}")
+                            if getattr(self, '_auto_show_disk_info', False):
+                                self.root.after(200, self.show_disk_info)
+                    else:
+                        messagebox.showwarning("Extended FS Error", error or f"Could not mount {fs_name}")
+                else:
+                    detected = fs_name if fs_name else "unknown"
+                    messagebox.showwarning("Not MarekFS", f"'{self.drive_path}' is not a MarekFS disk.\nDetected: {detected}")
         except PermissionError as pe:
             messagebox.showwarning("Permission Error", str(pe))
             self.path_var.set("marekfs_disk.img")
@@ -1168,7 +1716,7 @@ class ModernMarekFSApp:
         if self.partitions:
             p = self.partitions[self.active_partition_index]
             part_info = f" | Partition: {p['id']}"
-        self.status_var.set(f"✅ Disk: '{self.drive_path}'{part_info} | Items: {visible_count} | Next Sector: {self.next_free_sector} | Max: {THEORETICAL_MAX_FILES_64BIT:,}")
+        self.status_var.set(f"Disk: '{self.drive_path}'{part_info} | Items: {visible_count} | Next Sector: {self.next_free_sector} | Max: {MAX_FILE_COUNT:,}")
 
     def _file_search_match(self, record, query):
         """Match FileID, extension, size, description, prefix bytes and attributes.
@@ -1392,6 +1940,13 @@ class ModernMarekFSApp:
         if cached is not None and len(cached) == f["size"]:
             self._update_ram_cache_status()
             return cached
+
+        if getattr(self, "_extended_fs", None) and self._extended_fs_name:
+            data, error = read_extended_fs_file(self.drive_path, f["filename"], self._extended_fs_name, size=f["size"])
+            if error:
+                raise OSError(error)
+            return data
+
         fd = open_drive(self.drive_path, read_write=False)
         try:
             num_sectors = max(1, (f["size"] + SECTOR_SIZE - 1) // SECTOR_SIZE)
@@ -1437,9 +1992,10 @@ class ModernMarekFSApp:
         rel_name = values[1] if len(values) > 1 else values[0]
         if rel_name == "..":
             if "/" in self.current_folder:
-                self.current_folder = "/".join(self.current_folder.split("/")[:-1])
+                parent_folder = "/".join(self.current_folder.split("/")[:-1])
             else:
-                self.current_folder = ""
+                parent_folder = ""
+            self.current_folder = parent_folder
             self.render_tree()
             return
         full_path = f"{self.current_folder}/{rel_name}" if self.current_folder else rel_name
@@ -1517,7 +2073,7 @@ class ModernMarekFSApp:
             text = raw_content.decode("utf-8", errors="ignore")
             def text_save_callback(new_text, new_attrs, was_enc):
                 save_payload_to_disk(new_text.encode("utf-8"), new_attrs, was_enc)
-            ModernMarekFSEditor(self.root, f["filename"], text, text_save_callback, f["attributes"], f["encrypted"], on_close=release_cb)
+            ModernMarekFSEditor(self.root, f["filename"], text, text_save_callback, f["attributes"], f["encrypted"], on_close=release_cb, app=self)
 
     def show_properties(self):
         sel = self.tree.selection()
@@ -1902,8 +2458,7 @@ _FS_COLUMNS = [
 
 
 class SettingsWindow:
-    """Settings window: PreferredPartitionID, Extended Filesystem support,
-    and partition table for the currently open disk."""
+    """Settings window: PreferredPartitionID and partition table for the currently open disk."""
     def __init__(self, parent, app):
         self.app = app
         self.win = tk.Toplevel(parent)
@@ -1927,7 +2482,7 @@ class SettingsWindow:
         ttk.Button(btn_frame, text="🔄 Refresh from Disk", command=self.refresh_from_disk).pack(side=tk.LEFT, padx=4)
 
         # ---- Extended Filesystem Support --------------------------------
-        fs_outer = ttk.LabelFrame(self.win, text=" Extended Filesystem Support ", padding=12)
+        fs_outer = ttk.LabelFrame(self.win, text=" Extended Filesystem Support ")
         fs_outer.pack(fill=tk.X, padx=15, pady=5)
         ttk.Label(
             fs_outer,
@@ -1953,7 +2508,8 @@ class SettingsWindow:
                 )
                 cb.grid(row=row, column=col, sticky=tk.W, padx=8, pady=2)
 
-        fs_btn = ttk.Frame(fs_outer); fs_btn.pack(fill=tk.X, pady=(10, 0))
+        fs_btn = ttk.Frame(fs_outer)
+        fs_btn.pack(fill=tk.X, pady=(10, 0))
         ttk.Button(
             fs_btn, text="💾 Save Filesystem Settings",
             style="Accent.TButton", command=self.save_fs_support,
