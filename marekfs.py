@@ -48,7 +48,7 @@ from marekfs_core import (
     load_programdata_config, save_programdata_config,
     get_preferred_partition_id, set_preferred_partition_id,
     PROGRAM_DATA_CONFIG_PATH, ensure_scanner_config, update_scanner_rules,
-    check_clamav_update, CLAMAV_CHECK_INTERVAL_SECONDS,
+    check_scanner_update, CLAMAV_CHECK_INTERVAL_SECONDS,
     get_extended_fs_support, set_extended_fs_support, ALL_EXTENDED_FS,
 )
 from marekfs_core import (
@@ -62,7 +62,8 @@ from marekfs_theme import (
 )
 from marekfs_views import (
     ModernMarekFSArchiveViewer, ModernMarekFSProperties, ModernMarekFSEditor,
-    DiskTestWindow, VisualizeWindow, MediaViewer, VirusScanWindow, ChecksumsWindow,
+    DiskTestWindow, DriveCloneWindow, VisualizeWindow, MediaViewer,
+    VirusScanWindow, ChecksumsWindow,
     ScannerUpdateProgressWindow, ClamAVUpdateSettingsWindow,
 )
 from marekfs_dashboard import DashboardWindow
@@ -147,7 +148,7 @@ class ModernMarekFSApp:
         # loop isn't active yet).
         try:
             self.root.after(100, lambda: threading.Thread(target=self._initialise_scanner_rules, daemon=True).start())
-            self.root.after(200, lambda: self._start_clamav_checker())
+            self.root.after(200, lambda: self._start_scanner_checker())
         except Exception:
             # If scheduling fails (very unusual), fall back to starting them
             # immediately but guarded inside the functions.
@@ -156,10 +157,10 @@ class ModernMarekFSApp:
             except Exception:
                 pass
             try:
-                self._start_clamav_checker()
+                self._start_scanner_checker()
             except Exception:
                 pass
-        self._clamav_prompt_open = False
+        self._scanner_prompt_open = False
         self.show_hidden = tk.BooleanVar(value=True)
 
         self.cache_blown = True
@@ -251,48 +252,73 @@ class ModernMarekFSApp:
         except Exception:
             pass
 
-    # --- ClamAV database auto-updater ---------------------------------------
-    def _start_clamav_checker(self):
-        """Every 4 hours (in a background thread), check whether ClamAV's
-        free public mirror has a newer database than the one MarekFS Scanner
-        has installed. If so, ask the user before downloading anything."""
+    # --- Scanner auto-updater (ClamAV database + YARA rules) ------------------
+    def _start_scanner_checker(self):
+        """Every 4 hours (in a background thread), check whether ClamAV's free
+        public mirror has a newer database OR the official YARA Forge repo has
+        a newer rule package than what MarekFS Scanner has installed. If so,
+        ask the user before downloading anything."""
+
         def loop():
             time.sleep(20)  # let the app finish starting up first
             while True:
                 try:
-                    result = check_clamav_update(self.scanner_config)
+                    result = check_scanner_update(self.scanner_config)
                     if result.get("available"):
-                        self.root.after(0, lambda r=result: self._prompt_clamav_update(r))
+                        self.root.after(0, lambda r=result: self._prompt_scanner_update(r))
                 except Exception:
                     pass
                 time.sleep(CLAMAV_CHECK_INTERVAL_SECONDS)
         threading.Thread(target=loop, daemon=True).start()
 
-    def _prompt_clamav_update(self, result):
-        if self._clamav_prompt_open:
+    def _prompt_scanner_update(self, result):
+        if self._scanner_prompt_open:
             return
-        self._clamav_prompt_open = True
+        self._scanner_prompt_open = True
         try:
+            lines = ["New updates are available for MarekFS Scanner:\n"]
+            clamav = result.get("clamav") or {}
+            yara = result.get("yara") or {}
+            if clamav.get("available"):
+                lines.append(f"• ClamAV database → version {clamav.get('version')}")
+            if yara.get("available"):
+                yv = yara.get("version")
+                lines.append(f"• YARA rules → version {yv}" if yv else "• YARA rules: new version available")
+            lines.append("\nDo you want to install the update now?")
             install = messagebox.askyesno(
                 "MarekFS Scanner Update",
-                "A newer ClamAV database is available.\n\n"
-                "Do you want to install new update for MarekFS Scanner?")
+                "\n".join(lines))
             if install:
                 def on_done(update_result, error):
                     if error:
                         self.status_var.set(f"Scanner update failed: {error}")
                     else:
-                        self.status_var.set(f"Scanner updated · {update_result['hashes']:,} ClamAV hashes")
+                        self.status_var.set(self._scanner_update_summary(update_result))
                 ScannerUpdateProgressWindow(self.root, self.scanner_config, on_done=on_done)
         finally:
-            self._clamav_prompt_open = False
+            self._scanner_prompt_open = False
+
+    @staticmethod
+    def _scanner_update_summary(update_result):
+        """Build a short status line from the combined ClamAV + YARA result."""
+        if not update_result:
+            return "Scanner updated"
+        parts = []
+        hashes = update_result.get("hashes") or 0
+        if hashes:
+            parts.append(f"{hashes:,} ClamAV hashes")
+        rfiles = update_result.get("rule_files") or 0
+        rsrc = update_result.get("rule_sources_updated") or 0
+        if rfiles or rsrc:
+            parts.append(f"{rfiles:,} YARA rules ({rsrc} source(s))")
+        return ("Scanner updated · " + " · ".join(parts)) if parts else "Scanner updated"
 
     def open_scanner_update_settings(self):
         def refreshed(update_result, error):
             if error:
                 self.status_var.set(f"Scanner update failed: {error}")
             elif update_result:
-                self.status_var.set(f"Scanner updated · {update_result['hashes']:,} ClamAV hashes")
+                self.status_var.set(self._scanner_update_summary(update_result))
         ClamAVUpdateSettingsWindow(self.root, self.scanner_config, on_check_now=refreshed)
 
     def _load_download_import_state(self):
@@ -716,6 +742,7 @@ class ModernMarekFSApp:
         ttk.Button(tool_frame, text="👁️ Visualize Drive Data", command=self.visualize_drive_data).pack(side=tk.LEFT, padx=4)
         ttk.Button(tool_frame, text="⚡ Stress Test", command=self.run_stress_test).pack(side=tk.LEFT, padx=4)
         ttk.Button(tool_frame, text="🧪 Disk Test", command=self.run_disk_test).pack(side=tk.LEFT, padx=4)
+        ttk.Button(tool_frame, text="💽 Clone Drive", command=self.run_drive_clone).pack(side=tk.LEFT, padx=4)
         ttk.Button(tool_frame, text="🗑️ Blow Cache", command=self.blow_cache).pack(side=tk.LEFT, padx=4)
         ttk.Button(tool_frame, text="🛡 Scanner Updates", command=self.open_scanner_update_settings).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(tool_frame, text="🔧 Cache editing (ADVANCED) — RWX", variable=self.cache_advanced).pack(side=tk.LEFT, padx=15)
@@ -1342,6 +1369,17 @@ class ModernMarekFSApp:
             stop_evt.set(); orig_close()
         win._on_close = close_and_evt
         threading.Thread(target=work, daemon=True).start()
+
+    def run_drive_clone(self):
+        """Open the Clone Drive window: byte-for-byte copy of one disk/image
+        onto another, with safety confirmation and live progress."""
+        def _clone_done(result):
+            try:
+                if result and result.get("ok") and result.get("bytes"):
+                    self.status_var.set(f"Clone complete · {format_bytes(result['bytes'])} copied")
+            except Exception:
+                pass
+        DriveCloneWindow(self.root, on_done=_clone_done)
 
     # --- Disk operations ------------------------------------------------
     def format_disk(self):

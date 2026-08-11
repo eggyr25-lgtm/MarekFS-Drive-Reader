@@ -190,6 +190,8 @@ FILEID_DB_PATH = os.path.join(PROGRAM_DATA_CONFIG_DIR, "file_ids.json")
 FILEID_MAX = (1 << 64) - 1
 SCANNER_MAX_RULE_BYTES = 16 * 1024 * 1024
 SCANNER_MAX_FILE_BYTES = 256 * 1024 * 1024
+# Official YARA rule sources. Only HTTPS GitHub URLs are accepted, and the
+# scanner downloads rule packages safely into ProgramData/yara_rules.
 SCANNER_RULE_SOURCES = {
     "YARA Forge Core": "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip",
     "YARA Forge Extended": "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-extended.zip",
@@ -207,6 +209,9 @@ CLAMAV_DATABASES = {"daily": "daily.cvd", "main": "main.cvd"}
 CLAMAV_HEADER_SIZE = 512
 CLAMAV_CHECK_INTERVAL_SECONDS = 4 * 60 * 60  # 4 hours
 CLAMAV_MAX_BYTES = 256 * 1024 * 1024
+# Official YARA Forge release feed used for the cheap "is a newer rule set
+# available?" check. Only the JSON tag name is fetched (no rule bytes).
+YARA_RELEASE_API_URL = "https://api.github.com/repos/YARAHQ/yara-forge/releases/latest"
 
 
 def is_admin():
@@ -674,8 +679,21 @@ def clone_drive(src_path: str, dst_path: str, progress=None, verify: bool = Fals
         src_fd = open_drive(src_path, read_write=False)
         dst_fd = open_drive(dst_path, read_write=True)
 
-        src_size = get_drive_size(src_fd)
-        dst_size = get_drive_size(dst_fd)
+        # Measure sizes from the *paths* first (DeviceIoControl + getsize), and
+        # take the larger of path/fd measurements so raw Windows devices and
+        # sparse image files are both handled correctly.
+        src_size = get_drive_size_bytes(src_path)
+        dst_size = get_drive_size_bytes(dst_path)
+        fd_src_size = get_drive_size(src_fd)
+        fd_dst_size = get_drive_size(dst_fd)
+        if src_size <= 0:
+            src_size = fd_src_size
+        if dst_size <= 0:
+            dst_size = fd_dst_size
+        if fd_src_size > src_size:
+            src_size = fd_src_size
+        if fd_dst_size > dst_size:
+            dst_size = fd_dst_size
         if dst_size < src_size:
             raise ValueError(f"Destination size ({dst_size}) is smaller than source ({src_size})")
 
@@ -856,7 +874,12 @@ def _scanner_default_config():
             "clamav_last_check": None,
             "clamav_last_version": None,
             "clamav_last_installed": None,
-            "clamav_last_hash_count": 0}
+            "clamav_last_hash_count": 0,
+            # YARA rule auto-update state (official YARA Forge releases).
+            "yara_last_check": None,
+            "yara_last_version": None,
+            "yara_last_installed": None,
+            "yara_last_rule_count": 0}
 
 
 def load_scanner_config():
@@ -888,18 +911,37 @@ def ensure_scanner_config():
     return cfg
 
 
-def _safe_download(url, destination, max_bytes=SCANNER_MAX_RULE_BYTES):
+def _safe_download(url, destination, max_bytes=SCANNER_MAX_RULE_BYTES, progress=None):
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != "https" or parsed.netloc not in {"github.com", "raw.githubusercontent.com", "github.com"}:
+    if parsed.scheme != "https" or parsed.netloc not in {"github.com", "raw.githubusercontent.com"}:
         raise ValueError("Scanner rule sources must use HTTPS GitHub URLs.")
     req = urllib.request.Request(url, headers={"User-Agent": "MarekFS-Scanner/1.0"})
     with urllib.request.urlopen(req, timeout=30) as response:
         content_length = int(response.headers.get("Content-Length") or 0)
         if content_length > max_bytes:
             raise ValueError("Downloaded rule file exceeds the safety size limit.")
-        data = response.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise ValueError("Downloaded rule file exceeds the safety size limit.")
+        total = content_length or 0
+        if progress:
+            try:
+                progress(0, total)
+            except Exception:
+                pass
+        read = 0
+        chunks = []
+        while True:
+            block = response.read(65536)
+            if not block:
+                break
+            chunks.append(block)
+            read += len(block)
+            if read > max_bytes:
+                raise ValueError("Downloaded rule file exceeds the safety size limit.")
+            if progress:
+                try:
+                    progress(read, total)
+                except Exception:
+                    pass
+    data = b"".join(chunks)
     if not data.strip():
         raise ValueError("Downloaded rule file is empty.")
     os.makedirs(os.path.dirname(destination), exist_ok=True)
@@ -910,13 +952,29 @@ def _safe_download(url, destination, max_bytes=SCANNER_MAX_RULE_BYTES):
     return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
-def update_scanner_rules(config=None):
+def update_scanner_rules(config=None, progress=None):
+    """Download every configured YARA rule source (HTTPS only) and extract
+    rule packages into ProgramData/yara_rules.
+
+    `progress`, if given, is called as progress(phase, done, total):
+      - phase "yara-rules": done/total are bytes of the current rule
+        download (streamed live).
+      - phase "yara-rules:source": done/total count finished rule sources,
+        so a UI can show "source 2/2".
+    """
     cfg = config or ensure_scanner_config()
     results = []
-    for name, url in cfg.get("rule_sources", {}).items():
+    sources = list(cfg.get("rule_sources", {}).items())
+    for idx, (name, url) in enumerate(sources):
         dest = os.path.join(SCANNER_RULE_DIR, re.sub(r"[^A-Za-z0-9_.-]+", "_", name))
         try:
-            info = _safe_download(url, dest)
+            def _rule_progress(read, total, _name=name):
+                if progress:
+                    try:
+                        progress("yara-rules", read, total)
+                    except Exception:
+                        pass
+            info = _safe_download(url, dest, progress=_rule_progress)
             if url.lower().endswith(".zip"):
                 with zipfile.ZipFile(dest, "r") as archive:
                     members = [m for m in archive.infolist() if not m.is_dir() and m.filename.lower().endswith((".yar", ".yara"))]
@@ -940,7 +998,23 @@ def update_scanner_rules(config=None):
                 results.append({"source": name, "path": dest, "status": "updated", **info})
         except Exception as e:
             results.append({"source": name, "path": dest, "status": "error", "error": str(e)})
+        if progress:
+            try:
+                progress("yara-rules:source", idx + 1, len(sources))
+            except Exception:
+                pass
     cfg["last_update"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # Record the YARA Forge release tag + rule file counts on success.
+    ok = [r for r in results if r.get("status") == "updated"]
+    if ok:
+        try:
+            yinfo = check_yara_update(cfg)  # cheap GitHub API tag lookup
+            if yinfo.get("version"):
+                cfg["yara_last_version"] = yinfo["version"]
+        except Exception:
+            pass
+        cfg["yara_last_installed"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        cfg["yara_last_rule_count"] = sum(int(r.get("files", 0)) for r in ok)
     save_scanner_config(cfg)
     return results
 
@@ -1054,7 +1128,48 @@ def check_clamav_update(config=None):
     return result
 
 
-def _extract_cvd_hashes(cvd_bytes):
+def check_yara_update(config=None, save=True):
+    """Cheap check: query the GitHub API for the latest YARA Forge release tag
+    (a small JSON document) and compare it with the last version installed.
+    HTTPS only; no rule bytes are downloaded by this check. Respects the
+    `yara_enabled` setting, mirroring ClamAV's auto-update toggle."""
+    cfg = config or ensure_scanner_config()
+    result = {"available": False, "version": None, "error": None,
+              "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if not cfg.get("yara_enabled", True):
+        result["error"] = "YARA rule auto-updates are disabled."
+        return result
+    try:
+        req = urllib.request.Request(YARA_RELEASE_API_URL, headers={
+            "User-Agent": "MarekFS-Scanner/1.0",
+            "Accept": "application/vnd.github+json",
+        })
+        with urllib.request.urlopen(req, timeout=20) as response:
+            payload = response.read(2 * 1024 * 1024)
+        tag = json.loads(payload.decode("utf-8", "ignore")).get("tag_name")
+        if tag:
+            result["version"] = tag
+            result["available"] = tag != cfg.get("yara_last_version")
+    except Exception as e:
+        result["error"] = str(e)
+    cfg["yara_last_check"] = result["checked_at"]
+    if save:
+        save_scanner_config(cfg)
+    return result
+
+
+def check_scanner_update(config=None):
+    """Combined cheap check for everything MarekFS Scanner can automatically
+    update: the ClamAV signature database AND the official YARA Forge rule
+    packages. Returns one dict with nested `clamav` and `yara` results,
+    plus `available` = True when at least one of them is newer."""
+    cfg = config or ensure_scanner_config()
+    clamav = check_clamav_update(cfg)
+    yara = check_yara_update(cfg)
+    available = bool(clamav.get("available")) or bool(yara.get("available"))
+    save_scanner_config(cfg)
+    return {"available": available, "clamav": clamav, "yara": yara,
+            "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     """CVD body (after the 512-byte header) is a gzip-compressed tar archive
     containing the database's component files. We only care about the
     hash-signature members (.hsb = SHA-256 full-file hashes, .hdb = MD5),
@@ -1137,6 +1252,52 @@ def download_clamav_update(config=None, progress=None, max_bytes=CLAMAV_MAX_BYTE
     cfg["clamav_last_hash_count"] = len(new_hashes)
     save_scanner_config(cfg)
     return {"hashes": len(new_hashes), "bytes": len(data), "version": version}
+
+
+def download_scanner_update(config=None, progress=None, max_bytes=CLAMAV_MAX_BYTES, force=False):
+    """Run the full MarekFS Scanner update: refresh BOTH the ClamAV signature
+    database AND the official YARA Forge rule packages.
+
+    `progress`, if given, is called as progress(phase, done, total) where
+      - phase "clamav": done/total are bytes of the CVD download;
+      - phase "yara-rules": done/total are bytes of a rule source download;
+      - phase "yara-rules:source": done/total count completed rule sources.
+    When `force` is False, disabled components (clamav_enabled/yara_enabled)
+    are skipped; an explicit install always passes force=True.
+    """
+    cfg = config or ensure_scanner_config()
+
+    def _cb(phase, done, total):
+        if progress:
+            try:
+                progress(phase, done, total)
+            except Exception:
+                pass
+
+    if cfg.get("clamav_enabled") or force:
+        clamav_result = download_clamav_update(cfg, progress=lambda r, t: _cb("clamav", r, t),
+                                               max_bytes=max_bytes)
+    else:
+        clamav_result = {"hashes": 0, "bytes": 0, "version": None, "skipped": True}
+
+    if cfg.get("yara_enabled", True) or force:
+        rule_results = update_scanner_rules(cfg, progress=_cb)
+    else:
+        rule_results = [{"source": "YARA rules", "status": "skipped"}]
+
+    ok_sources = [r for r in rule_results if r.get("status") == "updated"]
+    errors = [r for r in rule_results if r.get("status") == "error"]
+    return {
+        "hashes": clamav_result.get("hashes", 0),
+        "bytes": clamav_result.get("bytes", 0),
+        "clamav_version": clamav_result.get("version"),
+        "rules": rule_results,
+        "rule_sources_updated": len(ok_sources),
+        "rule_sources_total": len(rule_results),
+        "rule_files": sum(int(r.get("files", 0)) for r in ok_sources),
+        "yara_version": cfg.get("yara_last_version"),
+        "rule_errors": [r.get("error") for r in errors],
+    }
 
 
 def _ascii_strings(data, minimum=4):

@@ -89,7 +89,9 @@ from marekfs_core import (
     find_av_scanners, build_av_command,
     ensure_scanner_config, scan_bytes_with_builtin_scanner, update_scanner_rules,
     update_scanner_hashes, data_checksum,
-    save_scanner_config, check_clamav_update, download_clamav_update,
+    save_scanner_config, check_scanner_update,
+    download_scanner_update,
+    clone_drive, get_available_drives, get_drive_size_bytes,
 )
 
 _GLOBAL_EDITOR_INSTANCE = None
@@ -1043,6 +1045,11 @@ class VirusScanWindow:
         ttk.Button(top, text="Update rules", command=self.update_rules).pack(side=tk.RIGHT, padx=4)
         ttk.Button(top, text="Update hashes", command=self.update_hashes).pack(side=tk.RIGHT, padx=4)
         ttk.Label(top, text=f"{format_bytes(len(raw_bytes))}").pack(side=tk.RIGHT)
+        ttk.Label(body, wraplength=740, text=(
+            "This built-in scanner uses official YARA Forge rule packages from GitHub "
+            "and ClamAV's public mirror. Rule downloads use HTTPS only and are stored "
+            "locally under ProgramData."
+        )).pack(anchor=tk.W, pady=(8, 4))
         body = ttk.Frame(self.win); body.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.out = tk.Text(body, font=Font(family="Consolas", size=10), bg="#0d1117", fg="#c9d1d9", wrap=tk.WORD)
         sb = ttk.Scrollbar(body, command=self.out.yview)
@@ -1145,9 +1152,10 @@ class VirusScanWindow:
 
 
 class ScannerUpdateProgressWindow:
-    """Live-progress downloader for a ClamAV database update.
+    """Live-progress downloader for a full MarekFS Scanner update: the ClamAV
+    signature database AND the official YARA Forge rule packages.
 
-    Shows a determinate progress bar plus a precise "XX.XXX%" readout that
+    Shows a determinate progress bar plus a precise \"XX.XXX%\" readout that
     updates on every chunk. Blocks its own close button until the download
     finishes (success or failure) so the operation can't be abandoned
     mid-write.
@@ -1160,14 +1168,14 @@ class ScannerUpdateProgressWindow:
         self.win = tk.Toplevel(parent)
         theme_existing_window(self.win, parent)
         self.win.title("🛡 MarekFS Scanner Update")
-        self.win.geometry("480x190")
+        self.win.geometry("480x200")
         self.win.resizable(True, True)
         self.win.protocol("WM_DELETE_WINDOW", self._on_close_attempt)
 
         body = ttk.Frame(self.win, padding=16)
         body.pack(fill=tk.BOTH, expand=True)
         ttk.Label(body, text="MarekFS Scanner Update", style="Title.TLabel").pack(anchor=tk.W)
-        self.status_var = tk.StringVar(value="Connecting to the ClamAV database mirror…")
+        self.status_var = tk.StringVar(value="Checking ClamAV + YARA update sources…")
         ttk.Label(body, textvariable=self.status_var, wraplength=440).pack(anchor=tk.W, pady=(4, 12))
 
         self.progress = ttk.Progressbar(body, mode="determinate", maximum=100000, value=0)
@@ -1188,9 +1196,9 @@ class ScannerUpdateProgressWindow:
     def _on_close_attempt(self):
         if self._finished:
             self.win.destroy()
-        # Ignore attempts to close while the download is in progress.
+        # Ignore attempts to close while the update is in progress.
 
-    def _on_progress(self, read, total):
+    def _on_progress(self, phase, read, total):
         if total:
             percent = min(100.0, (read / total) * 100.0)
             bytes_label = f"{format_bytes(read)} / {format_bytes(total)}"
@@ -1200,16 +1208,25 @@ class ScannerUpdateProgressWindow:
             percent = min(99.999, (read / (128 * 1024 * 1024)) * 100.0)
             bytes_label = format_bytes(read)
 
+        if phase == "clamav":
+            status_text = "Downloading ClamAV signature database…"
+        elif phase == "yara-rules:source":
+            status_text = f"YARA rule packages refreshed ({read}/{total} sources)…"
+            percent = min(100.0, (read / total) * 100.0)
+            bytes_label = f"source {read} of {total}"
+        else:  # "yara-rules"
+            status_text = "Downloading YARA rule packages…"
+
         def update_ui():
             self.progress["value"] = percent * 1000  # maximum=100000 -> 3 decimal places
             self.pct_var.set(f"{percent:06.3f}%")
             self.bytes_var.set(bytes_label)
-            self.status_var.set("Downloading ClamAV database update…")
+            self.status_var.set(status_text)
         self.win.after(0, update_ui)
 
     def _run(self):
         try:
-            result = download_clamav_update(self.scanner_config, progress=self._on_progress)
+            result = download_scanner_update(self.scanner_config, progress=self._on_progress, force=True)
         except Exception as e:
             self.win.after(0, lambda: self._finish(None, error=str(e)))
             return
@@ -1227,8 +1244,20 @@ class ScannerUpdateProgressWindow:
         else:
             self.progress["value"] = 100000
             self.pct_var.set("100.000%")
-            self.status_var.set(f"Installed — {result['hashes']:,} ClamAV signature hashes now active "
-                                f"(database version {result['version']}).")
+            parts = []
+            if result.get("hashes"):
+                ver = result.get("clamav_version")
+                parts.append(f"{result['hashes']:,} ClamAV hashes"
+                             + (f" (db v{ver})" if ver else ""))
+            rule_files = result.get("rule_files", 0)
+            rule_sources = result.get("rule_sources_updated", 0)
+            if rule_sources:
+                yver = result.get("yara_version")
+                parts.append(f"{rule_files:,} YARA rules from {rule_sources} source(s)"
+                             + (f" (v{yver})" if yver else ""))
+            if not parts:
+                parts.append("no update sources returned results")
+            self.status_var.set("Installed — " + " · ".join(parts) + ".")
         if self.on_done:
             try:
                 self.on_done(result, error)
@@ -1236,10 +1265,222 @@ class ScannerUpdateProgressWindow:
                 pass
 
 
+class DriveCloneWindow:
+    """Clone a source drive/image onto a destination drive/image byte-for-byte
+    with a live progress bar. Destinations that are raw Windows device paths
+    (\\\\.\\C:, \\\\.\\PhysicalDriveN) require an explicit safety
+    acknowledgement before cloning starts."""
+    def __init__(self, parent, on_done=None):
+        self.on_done = on_done
+        self._finished = False
+        self._running = False
+        self._total = 0
+
+        self.win = tk.Toplevel(parent)
+        theme_existing_window(self.win, parent)
+        self.win.title("💽 Clone Drive")
+        self.win.geometry("680x480")
+        self.win.resizable(True, True)
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close_attempt)
+
+        body = ttk.Frame(self.win, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="Clone Drive — disk → disk / image", style="Title.TLabel").pack(anchor=tk.W)
+        ttk.Label(body, wraplength=630, text=(
+            "Copy an entire source drive or image to a destination byte-for-byte. "
+            "The destination is OVERWRITTEN completely. Raw device paths such as "
+            "Raw device paths such as \\\\.\\PhysicalDriveN or \\\\.\\X: require Administrator rights."
+        )).pack(anchor=tk.W, pady=(4, 10))
+
+        drives = get_available_drives()
+        drive_values = [d[0] for d in drives]
+        self._drive_map = dict(drives)
+
+        src_row = ttk.Frame(body); src_row.pack(fill=tk.X, pady=4)
+        ttk.Label(src_row, text="Source (read):").pack(side=tk.LEFT)
+        self.src_var = tk.StringVar(value=drive_values[0] if drive_values else "")
+        self.src_combo = ttk.Combobox(src_row, textvariable=self.src_var, values=drive_values,
+                                      state="normal", width=32)
+        self.src_combo.pack(side=tk.LEFT, padx=6)
+        ttk.Button(src_row, text="Browse image…", command=lambda: self._browse("src")).pack(side=tk.LEFT)
+        self.src_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_sizes())
+
+        dst_row = ttk.Frame(body); dst_row.pack(fill=tk.X, pady=4)
+        ttk.Label(dst_row, text="Destination:").pack(side=tk.LEFT)
+        self.dst_var = tk.StringVar(value=drive_values[1] if len(drive_values) > 1
+                                    else (drive_values[0] if drive_values else ""))
+        self.dst_combo = ttk.Combobox(dst_row, textvariable=self.dst_var, values=drive_values,
+                                      state="normal", width=32)
+        self.dst_combo.pack(side=tk.LEFT, padx=6)
+        ttk.Button(dst_row, text="Browse image…", command=lambda: self._browse("dst")).pack(side=tk.LEFT)
+        self.dst_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_sizes())
+
+        ttk.Label(body, wraplength=630, text=(
+            "You can also type a raw device path (\\\\.\\PhysicalDriveN, \\\\.\\X:) "
+            "or an image filename directly into the boxes above."
+        )).pack(anchor=tk.W, pady=(2, 10))
+
+        opts = ttk.Frame(body); opts.pack(fill=tk.X, pady=4)
+        self.verify_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, text="Verify destination size after clone", variable=self.verify_var).pack(side=tk.LEFT)
+        self.ack_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="I understand the destination will be fully overwritten",
+                        variable=self.ack_var).pack(side=tk.LEFT, padx=14)
+
+        sizes = ttk.Frame(body); sizes.pack(fill=tk.X, pady=(4, 8))
+        ttk.Label(sizes, text="Source size: ").pack(side=tk.LEFT)
+        self.src_size_var = tk.StringVar(value="—")
+        ttk.Label(sizes, textvariable=self.src_size_var).pack(side=tk.LEFT)
+        ttk.Label(sizes, text="    Destination size: ").pack(side=tk.LEFT)
+        self.dst_size_var = tk.StringVar(value="—")
+        ttk.Label(sizes, textvariable=self.dst_size_var).pack(side=tk.LEFT)
+        ttk.Button(sizes, text="Refresh sizes", command=self.refresh_sizes).pack(side=tk.RIGHT)
+
+        prog = ttk.Frame(body); prog.pack(fill=tk.X, pady=(6, 0))
+        self.progress = ttk.Progressbar(prog, mode="determinate", maximum=100000, value=0)
+        self.progress.pack(fill=tk.X)
+        row = ttk.Frame(body); row.pack(fill=tk.X, pady=(4, 0))
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(row, textvariable=self.status_var).pack(side=tk.LEFT)
+        self.pct_var = tk.StringVar(value="0.000%")
+        ttk.Label(row, textvariable=self.pct_var, font=("Consolas", 11, "bold")).pack(side=tk.RIGHT)
+
+        buttons = ttk.Frame(body); buttons.pack(fill=tk.X, pady=(14, 0))
+        self.start_btn = ttk.Button(buttons, text="▶ Start Clone", style="Accent.TButton", command=self.start)
+        self.start_btn.pack(side=tk.LEFT)
+        self.close_btn = ttk.Button(buttons, text="Close", command=self.win.destroy)
+        self.close_btn.pack(side=tk.RIGHT)
+
+    def _browse(self, which):
+        path = filedialog.askopenfilename(
+            parent=self.win, title="Choose a disk image",
+            filetypes=[("Disk images", "*.img *.iso *.bin *.raw *.marekimg *.vhd *.vhdx"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        var = self.src_var if which == "src" else self.dst_var
+        var.set(path)
+        self.refresh_sizes()
+
+    def _selected_path(self, var):
+        name = var.get().strip()
+        if not name:
+            return ""
+        return self._drive_map.get(name, name)
+
+    def refresh_sizes(self):
+        for which, var, out in (("src", self.src_var, self.src_size_var),
+                                ("dst", self.dst_var, self.dst_size_var)):
+            try:
+                path = self._selected_path(var)
+                size = get_drive_size_bytes(path) if path else 0
+                out.set(format_bytes(size) if size else "unknown")
+            except Exception:
+                out.set("unknown")
+
+    def start(self):
+        if self._running:
+            return
+        src = self._selected_path(self.src_var)
+        dst = self._selected_path(self.dst_var)
+        if not src or not dst:
+            messagebox.showwarning("Clone Drive", "Choose a source and a destination.", parent=self.win)
+            return
+        if src == dst:
+            messagebox.showerror("Clone Drive", "Source and destination must be different disks.", parent=self.win)
+            return
+        if dst.startswith("\\\\.\\") and not self.ack_var.get():
+            messagebox.showwarning(
+                "Clone Drive",
+                "This destination is a raw device. Tick\n"
+                "\"I understand the destination will be fully overwritten\"\n"
+                "before cloning onto it.", parent=self.win)
+            return
+        if not messagebox.askyesno(
+                "Clone Drive",
+                "The destination will be FULLY OVERWRITTEN. All data on it will be lost.\n\n"
+                f"Source:      {src}\n"
+                f"Destination: {dst}\n\n"
+                "Do you really want to start the clone?",
+                parent=self.win):
+            return
+        # Size sanity check before any bytes are written.
+        try:
+            src_size = get_drive_size_bytes(src)
+            dst_size = get_drive_size_bytes(dst)
+            if 0 < dst_size < src_size:
+                messagebox.showerror(
+                    "Clone Drive",
+                    f"Destination ({format_bytes(dst_size)}) is smaller than the source "
+                    f"({format_bytes(src_size)}).\nChoose a destination with at least the "
+                    "same size as the source.", parent=self.win)
+                return
+            self._total = src_size
+        except Exception as e:
+            messagebox.showwarning("Clone Drive", f"Could not measure sizes ({e}). Continuing anyway.",
+                                   parent=self.win)
+
+        self._running = True
+        self._finished = False
+        self.start_btn.configure(state="disabled")
+        self.close_btn.configure(state="disabled")
+        self.status_var.set("Cloning…")
+        threading.Thread(target=self._run_clone, args=(src, dst), daemon=True).start()
+
+    def _on_progress(self, done, total):
+        if total:
+            percent = min(100.0, (done / total) * 100.0)
+            bytes_label = f"{format_bytes(done)} / {format_bytes(total)}"
+        else:
+            percent = min(99.999, (done / (256 * 1024 * 1024)) * 100.0)
+            bytes_label = format_bytes(done)
+
+        def update_ui():
+            self.progress["value"] = percent * 1000
+            self.pct_var.set(f"{percent:06.3f}%")
+            self.status_var.set("Cloning… " + bytes_label)
+        self.win.after(0, update_ui)
+
+    def _run_clone(self, src, dst):
+        try:
+            clone_drive(src, dst, progress=self._on_progress, verify=self.verify_var.get())
+            self.win.after(0, lambda: self._finish({"ok": True, "src": src, "dst": dst, "bytes": self._total}))
+        except Exception as e:
+            self.win.after(0, lambda: self._finish({"ok": False, "error": str(e)}))
+
+    def _finish(self, result):
+        self._running = False
+        self._finished = True
+        self.start_btn.configure(state="normal")
+        self.close_btn.configure(state="normal")
+        if result.get("ok"):
+            self.progress["value"] = 100000
+            self.pct_var.set("100.000%")
+            copied = result.get("bytes", 0)
+            self.status_var.set(f"Clone complete — {format_bytes(copied)} copied.")
+            messagebox.showinfo("Clone Drive",
+                                f"Clone completed successfully.\n\n{format_bytes(copied)} copied\n"
+                                f"{result.get('src')} → {result.get('dst')}",
+                                parent=self.win)
+        else:
+            self.status_var.set(f"Clone failed: {result.get('error')}")
+            messagebox.showerror("Clone Drive", f"Clone failed:\n{result.get('error')}", parent=self.win)
+        if self.on_done:
+            try:
+                self.on_done(result)
+            except Exception:
+                pass
+
+    def _on_close_attempt(self):
+        if not self._running or self._finished:
+            self.win.destroy()
+
+
 class ClamAVUpdateSettingsWindow:
-    """Lets the user enable automatic ClamAV database updates. No account or
-    API key is needed — database.clamav.net is ClamAV's public, free update
-    mirror (the same one `freshclam` uses). Also supports a manual check."""
+    """Lets the user enable automatic MarekFS Scanner updates: the ClamAV
+    signature database (no account or API key — database.clamav.net is the
+    same public mirror `freshclam` uses) AND the official YARA Forge rule
+    packages. Supports a manual combined check + install."""
     def __init__(self, parent, scanner_config, on_check_now=None):
         self.scanner_config = scanner_config
         self.on_check_now = on_check_now
@@ -1247,32 +1488,46 @@ class ClamAVUpdateSettingsWindow:
         self.win = tk.Toplevel(parent)
         theme_existing_window(self.win, parent)
         self.win.title("🛡 MarekFS Scanner Updates")
-        self.win.geometry("520x340")
+        self.win.geometry("540x520")
 
         body = ttk.Frame(self.win, padding=16)
         body.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(body, text="ClamAV Database Auto-Update", style="Title.TLabel").pack(anchor=tk.W)
-        ttk.Label(body, wraplength=470, text=(
-            "MarekFS Scanner can automatically check ClamAV's free public database "
-            "mirror every 4 hours for signature updates. No account or API key is "
-            "required. Only SHA-256 hash signatures are extracted — never any "
-            "malware samples."
-        )).pack(anchor=tk.W, pady=(4, 12))
+        ttk.Label(body, text="MarekFS Scanner Updates", style="Title.TLabel").pack(anchor=tk.W)
+        ttk.Label(body, wraplength=500, text=(
+            "Updates the built-in scanner's two live components:\n"
+            "• ClamAV signature database (SHA-256 hashes only — never samples)\n"
+            "• Official YARA Forge rule packages (HTTPS from GitHub only)\n"
+            "Both are stored locally under ProgramData."
+        )).pack(anchor=tk.W, pady=(4, 10))
 
+        clamav_frame = ttk.LabelFrame(body, text="ClamAV signature database", padding=8)
+        clamav_frame.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(clamav_frame, wraplength=470, text=(
+            "Automatically check ClamAV's free public mirror every 4 hours."
+        )).pack(anchor=tk.W)
         self.enabled_var = tk.BooleanVar(value=bool(scanner_config.get("clamav_enabled")))
-        ttk.Checkbutton(body, text="Automatically check every 4 hours",
-                        variable=self.enabled_var).pack(anchor=tk.W)
-
-        db_row = ttk.Frame(body)
-        db_row.pack(fill=tk.X, pady=(10, 12))
+        ttk.Checkbutton(clamav_frame, text="Automatically check every 4 hours",
+                        variable=self.enabled_var).pack(anchor=tk.W, pady=(4, 6))
+        db_row = ttk.Frame(clamav_frame)
+        db_row.pack(fill=tk.X)
         ttk.Label(db_row, text="Database:").pack(side=tk.LEFT)
         self.db_var = tk.StringVar(value=scanner_config.get("clamav_database", "daily"))
         ttk.Combobox(db_row, textvariable=self.db_var, state="readonly", width=20,
                      values=["daily", "main"]).pack(side=tk.LEFT, padx=6)
-        ttk.Label(db_row, text="(daily = frequent updates, main = full base signatures)").pack(side=tk.LEFT, padx=6)
+        ttk.Label(db_row, text="(daily = frequent, main = full base)").pack(side=tk.LEFT, padx=6)
+
+        yara_frame = ttk.LabelFrame(body, text="YARA rules", padding=8)
+        yara_frame.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(yara_frame, wraplength=470, text=(
+            "Official YARA Forge rule packages from GitHub (Core + Extended)."
+        )).pack(anchor=tk.W)
+        self.yara_enabled_var = tk.BooleanVar(value=bool(scanner_config.get("yara_enabled", True)))
+        ttk.Checkbutton(yara_frame, text="Automatically check for new YARA rules every 4 hours",
+                        variable=self.yara_enabled_var).pack(anchor=tk.W, pady=4)
+        ttk.Button(yara_frame, text="Update YARA rules now", command=self.update_rules_now).pack(anchor=tk.W)
 
         self.status_var = tk.StringVar(value=self._status_text())
-        ttk.Label(body, textvariable=self.status_var, wraplength=470).pack(anchor=tk.W)
+        ttk.Label(body, textvariable=self.status_var, wraplength=500, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
 
         buttons = ttk.Frame(body)
         buttons.pack(fill=tk.X, pady=(16, 0))
@@ -1282,15 +1537,23 @@ class ClamAVUpdateSettingsWindow:
 
     def _status_text(self):
         cfg = self.scanner_config
-        last_check = cfg.get("clamav_last_check") or "never"
-        last_installed = cfg.get("clamav_last_installed") or "never"
-        count = cfg.get("clamav_last_hash_count", 0)
-        return (f"Last checked: {last_check}\n"
-                f"Last installed: {last_installed}  ·  {count:,} hashes")
+        c_last = cfg.get("clamav_last_check") or "never"
+        c_inst = cfg.get("clamav_last_installed") or "never"
+        c_count = cfg.get("clamav_last_hash_count", 0)
+        y_last = cfg.get("yara_last_check") or "never"
+        y_inst = cfg.get("yara_last_installed") or "never"
+        y_ver = cfg.get("yara_last_version") or "—"
+        y_count = cfg.get("yara_last_rule_count", 0)
+        return (f"ClamAV · checked: {c_last}\n"
+                f"        installed: {c_inst}  ·  {c_count:,} hashes\n"
+                f"YARA   · checked: {y_last}\n"
+                f"        version {y_ver}  ·  {y_count:,} rule files\n"
+                f"        installed: {y_inst}")
 
     def _apply_fields(self):
         self.scanner_config["clamav_enabled"] = bool(self.enabled_var.get())
         self.scanner_config["clamav_database"] = self.db_var.get()
+        self.scanner_config["yara_enabled"] = bool(self.yara_enabled_var.get())
 
     def save(self):
         self._apply_fields()
@@ -1298,31 +1561,67 @@ class ClamAVUpdateSettingsWindow:
         self.status_var.set(self._status_text())
         messagebox.showinfo("MarekFS Scanner Updates", "Settings saved.", parent=self.win)
 
-    def check_now(self):
+    def update_rules_now(self):
         self._apply_fields()
         save_scanner_config(self.scanner_config)
-        self.status_var.set("Checking the ClamAV database mirror…")
+        self.status_var.set("Updating YARA rules…")
 
         def work():
-            result = check_clamav_update(self.scanner_config)
+            results = update_scanner_rules(self.scanner_config)
+            ok = sum(1 for r in results if r.get("status") == "updated")
+            errs = [r.get("error") for r in results if r.get("status") == "error"]
 
             def done():
                 self.status_var.set(self._status_text())
-                if result.get("error"):
-                    messagebox.showerror("MarekFS Scanner Updates", result["error"], parent=self.win)
-                elif result.get("available"):
-                    if messagebox.askyesno(
-                            "MarekFS Scanner Update",
-                            "A new update is available.\n\n"
-                            "Do you want to install new update for MarekFS Scanner?",
-                            parent=self.win):
+                if errs:
+                    messagebox.showerror("YARA Rules",
+                                         f"{len(errs)} rule source(s) failed:\n" + "\n".join(errs[:5]),
+                                         parent=self.win)
+                else:
+                    messagebox.showinfo("YARA Rules",
+                                        f"YARA rules updated: {ok}/{len(results)} source(s).", parent=self.win)
+            self.win.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def check_now(self):
+        self._apply_fields()
+        save_scanner_config(self.scanner_config)
+        self.status_var.set("Checking ClamAV + YARA update sources…")
+
+        def work():
+            result = check_scanner_update(self.scanner_config)
+
+            def done():
+                self.status_var.set(self._status_text())
+                clamav = result.get("clamav") or {}
+                yara = result.get("yara") or {}
+                if result.get("available"):
+                    lines = ["New updates are available:\n"]
+                    if clamav.get("available"):
+                        lines.append(f"• ClamAV database → version {clamav.get('version')}")
+                    if yara.get("available"):
+                        yv = yara.get("version")
+                        lines.append(f"• YARA rules → version {yv}" if yv else "• YARA rules: new version available")
+                    lines.append("\nDo you want to install them now?")
+                    if messagebox.askyesno("MarekFS Scanner Update", "\n".join(lines), parent=self.win):
                         def refreshed(res, err):
                             self.status_var.set(self._status_text())
                             if self.on_check_now:
                                 self.on_check_now(res, err)
                         ScannerUpdateProgressWindow(self.win, self.scanner_config, on_done=refreshed)
                 else:
-                    messagebox.showinfo("MarekFS Scanner Updates", "Already up to date.", parent=self.win)
+                    errs = []
+                    if clamav.get("error") and "disabled" not in str(clamav.get("error")).lower():
+                        errs.append("ClamAV: " + clamav["error"])
+                    if yara.get("error") and "disabled" not in str(yara.get("error")).lower():
+                        errs.append("YARA: " + yara["error"])
+                    if errs:
+                        messagebox.showerror("MarekFS Scanner Updates",
+                                             "Update check failed:\n" + "\n".join(errs), parent=self.win)
+                    else:
+                        messagebox.showinfo("MarekFS Scanner Updates", "Already up to date.", parent=self.win)
             self.win.after(0, done)
 
         threading.Thread(target=work, daemon=True).start()
+
