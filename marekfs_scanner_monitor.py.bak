@@ -1,0 +1,663 @@
+"""MarekFS Real-Time Scanner Monitor: Silent file scanning with Windows toast
+notifications, quarantine management, and whitelist support.
+
+Monitors both MarekFS virtual filesystem and host system files in real-time,
+scans new/modified files with the built-in YARA+ClamAV scanner, and shows
+interactive toast notifications when threats are detected.
+
+Quarantined files are base64-encoded for safe storage. Host system scanning
+is disabled by default and can be toggled in settings.
+"""
+import os
+import sys
+import time
+import json
+import hashlib
+import base64
+import threading
+import subprocess
+import tempfile
+from pathlib import Path
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+# Windows-specific imports for toast notifications
+try:
+    from winrt.windows.ui.notifications import ToastNotificationManager, ToastNotification, ToastTemplateType
+    from winrt.windows.data.xml.dom import XmlDocument
+    WINDOWS_TOAST_AVAILABLE = True
+except ImportError:
+    WINDOWS_TOAST_AVAILABLE = False
+
+# Fallback to ctypes for Windows toast if winrt not available
+if sys.platform == 'win32' and not WINDOWS_TOAST_AVAILABLE:
+    try:
+        import ctypes
+        from ctypes import wintypes
+        WINDOWS_NATIVE_AVAILABLE = True
+    except ImportError:
+        WINDOWS_NATIVE_AVAILABLE = False
+
+from marekfs_core import (
+    ensure_scanner_config, save_scanner_config,
+    scan_bytes_with_builtin_scanner, scan_path_with_builtin_scanner,
+    PROGRAM_DATA_CONFIG_PATH
+)
+
+# Constants
+QUARANTINE_DIR = os.path.join(os.path.dirname(PROGRAM_DATA_CONFIG_PATH), "Quarantine")
+WHITELIST_FILE = os.path.join(os.path.dirname(PROGRAM_DATA_CONFIG_PATH), "whitelist.json")
+QUARANTINE_DB_FILE = os.path.join(QUARANTINE_DIR, "quarantine_db.json")
+SCAN_CONFIG_FILE = os.path.join(os.path.dirname(PROGRAM_DATA_CONFIG_PATH), "scanner_monitor_config.json")
+
+# Default monitored extensions (common malware targets)
+DEFAULT_MONITOR_EXTENSIONS = {
+    '.exe', '.dll', '.sys', '.drv', '.ocx', '.cpl', '.msi', '.msp', '.com', '.scr',
+    '.bat', '.cmd', '.ps1', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.wsh',
+    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.pdf',
+    '.zip', '.rar', '.7z', '.cab', '.iso', '.img',
+    '.html', '.htm', '.svg', '.jar', '.class',
+    '.py', '.pyw', '.ps1', '.rb', '.pl', '.sh',
+    '.lnk', '.msi', '.reg', '.pif', '.msp'
+}
+
+# File size limit for scanning (4.5GB)
+MAX_SCAN_FILE_SIZE = 4.5 * 1024 * 1024 * 1024
+
+# Debounce interval for file changes (seconds)
+FILE_CHANGE_DEBOUNCE = 2.0
+
+class QuarantineManager:
+    """Manages quarantined files with base64 encoding for safe storage."""
+    
+    def __init__(self):
+        self.quarantine_dir = QUARANTINE_DIR
+        self.db_file = Q
+class QuarantineManager:
+# File size limit for scanning (4.5GB)
+
+# Debounce interval for file changes (seconds)
+FILE_CHANGE_DEBOUNCE = 2.0
+# File size limit for scanning (4.5GB)
+# File size limit for scanning (4.5GB)
+# File size limit for scanning (4.5GB)
+# File size limit for scanning (100MB)
+# File size limit for scanning (4.5GB)
+
+# Debounce interval for file changes (seconds)
+FILE_CHANGE_DEBOUNCE = 2.0
+
+
+class QuarantineManager:
+    """Manages quarantined files with base64 encoding for safe storage."""
+    
+    def __init__(self):
+        self.quarantine_dir = QUARANTINE_DIR
+        self.db_file = QUARANTINE_DB_FILE
+        self._ensure_quarantine_dir()
+        self._load_db()
+    
+    def _ensure_quarantine_dir(self):
+        os.makedirs(self.quarantine_dir, exist_ok=True)
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetFileAttributesW(self.quarantine_dir, 0x2)
+            except Exception:
+                pass
+    
+    def _load_db(self):
+        if os.path.exists(self.db_file):
+            try:
+                with open(self.db_file, 'r') as f:
+                    self.db = json.load(f)
+            except Exception:
+                self.db = {"quarantine_files": []}
+        else:
+            self.db = {"quarantine_files": []}
+    
+    def _save_db(self):
+        with open(self.db_file, 'w') as f:
+            json.dump(self.db, f, indent=2)
+    
+    def quarantine_file(self, original_path, detection_name, scanner_result):
+        try:
+            original_path = str(Path(original_path).resolve())
+            if not os.path.exists(original_path):
+                return None
+            quarantine_id = hashlib.sha256(f"{original_path}{time.time()}".encode()).hexdigest()[:16]
+            with open(original_path, 'rb') as f:
+            encoded_data = base64.b64encode(file_data).decode('ascii')
+            original_hash = hashlib.sha256(file_data).hexdigest()
+            quarantine_file_path = os.path.join(self.quarantine_dir, f"{quarantine_id}.b64")
+            with open(quarantine_file_path, 'w') as f:
+                f.write(encoded_data)
+            os.remove(original_path)
+            quarantine_record = {
+                "id": quarantine_id,
+                "original_path": original_path,
+                "original_filename": os.path.basename(original_path),
+                "detection_name": detection_name,
+                "original_hash": original_hash,
+                "quarantine_hash": hashlib.sha256(encoded_data.encode()).hexdigest(),
+                "quarantine_date": datetime.now().isoformat(),
+                "file_size": len(file_data),
+                "scanner_result": scanner_result,
+                "actions": []
+            }
+            self.db["quarantine_files"].append(quarantine_record)
+            self._save_db()
+            return quarantine_id
+        except Exception as e:
+            print(f"Quarantine error: {e}")
+            return None
+    
+    def restore_file(self, quarantine_id, add_to_whitelist=False):
+        try:
+            record = next((r for r in self.db["quarantine_files"] if r["id"] == quarantine_id), None)
+            if not record:
+                return False, "Quarantine record not found"
+            quarantine_file_path = os.path.join(self.quarantine_dir, f"{quarantine_id}.b64")
+            if not os.path.exists(quarantine_file_path):
+                return False, "Quarantined file not found"
+            with open(quarantine_file_path, 'r') as f:
+                encoded_data = f.read()
+            file_data = base64.b64decode(encoded_data)
+            if hashlib.sha256(file_data).hexdigest() != record["original_hash"]:
+                return False, "File integrity check failed"
+            target_dir = os.path.dirname(record["original_path"])
+            os.makedirs(target_dir, exist_ok=True)
+            with open(record["original_path"], 'wb') as f:
+                f.write(file_data)
+            if add_to_whitelist:
+                WhitelistManager().add_hash(record["original_hash"], record["original_filename"])
+            os.remove(quarantine_file_path)
+            record["restored_date"] = datetime.now().isoformat()
+            record["actions"].append("restored")
+            self._save_db()
+            return True, f"File restored to {record['original_path']}"
+        except Exception as e:
+            return False, f"Restore error: {e}"
+    
+    def delete_quarantined(self, quarantine_id):
+        try:
+            record = next((r for r in self.db["quarantine_files"] if r["id"] == quarantine_id), None)
+            if not record:
+                return False, "Quarantine record not found"
+            quarantine_file_path = os.path.join(self.quarantine_dir, f"{quarantine_id}.b64")
+            if os.path.exists(quarantine_file_path):
+                os.remove(quarantine_file_path)
+            self.db["quarantine_files"] = [r for r in self.db["quarantine_files"] if r["id"] != quarantine_id]
+            self._save_db()
+            return True, "File permanently deleted"
+        except Exception as e:
+            return False, f"Delete error: {e}"
+    
+    def get_quarantine_list(self):
+        return self.db.get("quarantine_files", [])
+
+
+class WhitelistManager:
+    """Manages file hash whitelist to bypass scanning."""
+    
+    def __init__(self):
+        self.whitelist_file = WHITELIST_FILE
+        self._load_whitelist()
+    
+    def _load_whitelist(self):
+        if os.path.exists(self.whitelist_file):
+            try:
+                with open(self.whitelist_file, 'r') as f:
+                    self.whitelist = json.load(f)
+            except Exception:
+                self.whitelist = {"hashes": {}}
+        else:
+            self.whitelist = {"hashes": {}}
+    
+    def _save_whitelist(self):
+        with open(self.whitelist_file, 'w') as f:
+            json.dump(self.whitelist, f, indent=2)
+    
+    def add_hash(self, file_hash, filename=None, reason="User whitelist"):
+        self.whitelist["hashes"][file_hash] = {
+            "filename": filename or "unknown",
+            "reason": reason,
+            "added_date": datetime.now().isoformat()
+        }
+        self._save_whitelist()
+    
+    def is_whitelisted(self, file_hash):
+        return file_hash in self.whitelist.get("hashes", {})
+    
+    def remove_hash(self, file_hash):
+        if file_hash in self.whitelist.get("hashes", {}):
+            del self.whitelist["hashes"][file_hash]
+            self._save_whitelist()
+            return True
+        return False
+    
+    def get_all(self):
+        return self.whitelist.get("hashes", {})
+
+
+class ToastNotifier:
+    """Windows toast notification system with interactive actions."""
+    
+    def __init__(self):
+        self.app_id = "MarekFS.Scanner"
+        self._init_toast()
+    
+    def _init_toast(self):
+        if sys.platform != 'win32':
+            self.available = False
+            return
+        self.available = True
+        if WINDOWS_TOAST_AVAILABLE:
+            try:
+                self.manager = ToastNotificationManager.create_toast_notifier(self.app_id)
+                self.use_winrt = True
+                return
+            except Exception:
+                pass
+        if WINDOWS_NATIVE_AVAILABLE:
+            self.use_winrt = False
+            return
+        self.available = False
+    
+    def show_threat_notification(self, detection_name, filename, quarantine_id=None):
+        if not self.available:
+            self._show_fallback_notification(detection_name, filename, quarantine_id)
+            return
+        if self.use_winrt:
+            self._show_winrt_toast(detection_name, filename, quarantine_id)
+        else:
+            self._show_native_toast(detection_name, filename, quarantine_id)
+    
+    def _show_winrt_toast(self, detection_name, filename, quarantine_id):
+        try:
+            toast_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<toast activationType="protocol" launch="marekfs://scanner">
+    <visual>
+        <binding template="ToastImageAndText02">
+            <image id="1" src="ms-appx:///Assets/alert.png" altText="Virus Alert"/>
+            <text id="1">🛡️ Virus Detected</text>
+            <text id="2">{detection_name}</text>
+            <text id="3">File: {os.path.basename(filename)}</text>
+        </binding>
+    </visual>
+    <actions>
+        <action content="🗑️ Delete" arguments="delete:{quarantine_id}" activationType="background"/>
+        <action content="🔒 Keep in Quarantine" arguments="quarantine:{quarantine_id}" activationType="background"/>
+        <action content="↩️ Restore" arguments="restore:{quarantine_id}" activationType="background"/>
+        <action content="✅ Restore & Whitelist" arguments="whitelist:{quarantine_id}" activationType="background"/>
+    </actions>
+</toast>"""
+            toast_doc = XmlDocument()
+            toast_doc.load_xml(toast_xml)
+            toast = ToastNotification(toast_doc)
+            self.manager.show(toast)
+        except Exception as e:
+            print(f"Toast error: {e}")
+            self._show_fallback_notification(detection_name, filename, quarantine_id)
+    
+    def _show_native_toast(self, detection_name, filename, quarantine_id):
+        try:
+            ps_script = f"""
+[System.Windows.Forms.MessageBox]::Show(
+    "Virus detected: {detection_name}\nFile: {filename}\n\nThe file has been moved to quarantine.\n\nOpen MarekFS to manage the quarantined file.",
+    "MarekFS Scanner Alert",
+    [System.Windows.Forms.MessageBoxButtons]::OK,
+    [System.Windows.Forms.MessageBoxIcon]::Warning
+)
+"""
+            subprocess.Popen(["powershell", "-Command", ps_script], creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception:
+            self._show_fallback_notification(detection_name, filename, quarantine_id)
+    
+    def _show_fallback_notification(self, detection_name, filename, quarantine_id):
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            msg = (
+                f"🛡️ Virus Detected!\n\n"
+                f"Detection: {detection_name}\n"
+                f"File: {filename}\n\n"
+                f"The infected file has been moved to quarantine.\n\n"
+                f"Open MarekFS Scanner to:\n"
+                f"  • Delete the file permanently\n"
+                f"  • Keep it in quarantine\n"
+                f"  • Restore it to original location\n"
+                f"  • Restore and add to whitelist"
+            )
+            messagebox.showwarning("MarekFS Scanner Alert", msg, parent=root)
+            root.destroy()
+        except Exception:
+            print(f"MarekFS Scanner: Virus detected - {detection_name} in {filename}")
+    
+    def show_scan_complete_notification(self, files_scanned, threats_found):
+        if not self.available:
+            return
+        try:
+            if self.use_winrt:
+                toast_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<toast activationType="protocol" launch="marekfs://scanner">
+    <visual>
+        <binding template="ToastText02">
+            <text id="1">🛡️ Scan Complete</text>
+            <text id="2">Scanned {files_scanned} files, found {threats_found} threats</text>
+        </binding>
+    </visual>
+</toast>"""
+                toast_doc = XmlDocument()
+                toast_doc.load_xml(toast_xml)
+                toast = ToastNotification(toast_doc)
+                self.manager.show(toast)
+        except Exception:
+            pass
+
+
+class FileMonitor:
+    """Real-time file system monitor with debouncing and filtering."""
+    
+    def __init__(self, paths_to_monitor, extensions=None, ignore_patterns=None):
+        self.paths_to_monitor = paths_to_monitor
+        self.extensions = extensions or DEFAULT_MONITOR_EXTENSIONS
+        self.ignore_patterns = ignore_patterns or []
+        self._pending_scans = {}
+        self._lock = threading.Lock()
+        self._running = False
+        self._threads = []
+    
+    def start(self):
+        self._running = True
+        monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        monitor_thread.start()
+        self._threads.append(monitor_thread)
+    
+    def stop(self):
+        self._running = False
+        for thread in self._threads:
+            thread.join(timeout=5)
+    
+    def _monitor_loop(self):
+        known_files = {}
+        while self._running:
+            try:
+                for path in self.paths_to_monitor:
+                    if not os.path.exists(path):
+                        continue
+                    if os.path.isfile(path):
+                        self._check_file(path, known_files)
+                    elif os.path.isdir(path):
+                        self._check_directory(path, known_files)
+            except Exception as e:
+                print(f"Monitor error: {e}")
+            time.sleep(1)
+    
+    def _check_directory(self, dir_path, known_files):
+        try:
+            for root, dirs, files in os.walk(dir_path):
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['$Recycle.Bin', 'System Volume Information']]
+                for filename in files:
+                    file_path = os.path.join(root, filename)
+                    self._check_file(file_path, known_files)
+        except Exception:
+            pass
+    
+    def _check_file(self, file_path, known_files):
+        try:
+            if any(pattern in file_path for pattern in self.ignore_patterns):
+                return
+            _, ext = os.path.splitext(file_path)
+            if ext.lower() not in self.extensions:
+                return
+            stat = os.stat(file_path)
+            current_mtime = stat.st_mtime
+            current_size = stat.st_size
+            if file_path in known_files:
+                if known_files[file_path] == (current_mtime, current_size):
+                    return
+            self._schedule_scan(file_path)
+            known_files[file_path] = (current_mtime, current_size)
+        except Exception:
+            pass
+    
+    def _schedule_scan(self, file_path):
+        with self._lock:
+            self._pending_scans[file_path] = time.time()
+    
+    def _process_pending_scans(self):
+        current_time = time.time()
+        files_to_scan = []
+        with self._lock:
+            for file_path, last_modified in list(self._pending_scans.items()):
+                if current_time - last_modified >= FILE_CHANGE_DEBOUNCE:
+                    files_to_scan.append(file_path)
+                    del self._pending_scans[file_path]
+        return files_to_scan
+
+
+class ScannerMonitor:
+    """Main scanner monitor service - coordinates scanning, quarantine, and notifications."""
+    
+    def __init__(self, enable_host_scanning=False):
+        self.enable_host_scanning = enable_host_scanning
+        self.quarantine_manager = QuarantineManager()
+        self.whitelist_manager = WhitelistManager()
+        self.toast_notifier = ToastNotifier()
+        self.file_monitor = None
+        self._running = False
+        self._scan_thread = None
+        self._config = self._load_config()
+        self.marekfs_paths = self._get_marekfs_paths()
+        self.host_paths = self._get_host_paths()
+    
+    def _load_config(self):
+        if os.path.exists(SCAN_CONFIG_FILE):
+        return {"enable_host_scanning": False, "monitor_extensions": list(DEFAULT_MONITOR_EXTENSIONS), "max_file_size_mb": 4608, "auto_quarantine": True, "show_notifications": True}
+            try:
+                with open(SCAN_CONFIG_FILE, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"enable_host_scanning": False, "monitor_extensions": list(DEFAULT_MONITOR_EXTENSIONS), "max_file_size_mb": 100, "auto_quarantine": True, "show_notifications": True}
+    
+    def _save_config(self):
+        with open(SCAN_CONFIG_FILE, 'w') as f:
+            json.dump(self._config, f, indent=2)
+    
+    def _get_marekfs_paths(self):
+        return []
+    
+    def _get_host_paths(self):
+        user_profile = os.environ.get('USERPROFILE', 'C:\\Users\\Default')
+        return [os.path.join(user_profile, 'Downloads'), os.path.join(user_profile, 'Desktop'), os.path.join(user_profile, 'Documents'), os.path.join(os.environ.get('TEMP', 'C:\\Windows\\Temp')), os.path.join(os.environ.get('PROGRAMDATA', 'C:\\ProgramData'))]
+    
+    def start(self):
+        if self._running: return
+        self._running = True
+        paths_to_monitor = self.marekfs_paths.copy()
+        if self.enable_host_scanning or self._config.get("enable_host_scanning"):
+            paths_to_monitor.extend(self.host_paths)
+        self.file_monitor = FileMonitor(paths_to_monitor, extensions=set(self._config.get("monitor_extensions", list(DEFAULT_MONITOR_EXTENSIONS))), ignore_patterns=['node_modules', '.git', 'Windows', 'Program Files'])
+        self.file_monitor.start()
+        self._scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
+        self._scan_thread.start()
+        print(f"MarekFS Scanner Monitor started (host scanning: {'ON' if self.enable_host_scanning else 'OFF'})")
+    
+    def stop(self):
+        self._running = False
+        if self.file_monitor: self.file_monitor.stop()
+        if self._scan_thread: self._scan_thread.join(timeout=5)
+        print("MarekFS Scanner Monitor stopped")
+    
+    def _scan_loop(self):
+        while self._running:
+            try:
+                files_to_scan = self.file_monitor._process_pending_scans() if self.file_monitor else []
+                for file_path in files_to_scan: self._scan_file(file_path)
+            except Exception as e: print(f"Scan loop error: {e}")
+            time.sleep(0.5)
+    
+    def _scan_file(self, file_path):
+        try:
+            if os.path.getsize(file_path) > self._config.get("max_file_size_mb", 100) * 1024 * 1024: return
+            with open(file_path, 'rb') as f: file_data = f.read(1024 * 1024)
+            file_hash = hashlib.sha256(file_data).hexdigest()
+            if self.whitelist_manager.is_whitelisted(file_hash): return
+            result = scan_path_with_builtin_scanner(file_path)
+            if result.get("status") in ("malicious", "suspicious"):
+                findings = result.get("findings", [])
+                detection_name = findings[0].get("rule", "Unknown Threat") if findings else "Unknown Threat"
+                if self._config.get("auto_quarantine", True):
+                    quarantine_id = self.quarantine_manager.quarantine_file(file_path, detection_name, result)
+                    if quarantine_id and self._config.get("show_notifications", True):
+                        self.toast_notifier.show_threat_notification(detection_name, file_path, quarantine_id)
+                else:
+                    if self._config.get("show_notifications", True):
+                        self.toast_notifier.show_threat_notification(detection_name, file_path, None)
+        except Exception as e: print(f"Error scanning {file_path}: {e}")
+    
+    def handle_toast_action(self, action, quarantine_id):
+        try:
+            if action.startswith("delete:"): success, msg = self.quarantine_manager.delete_quarantined(quarantine_id); print(f"Delete result: {msg}")
+            elif action.startswith("restore:"): success, msg = self.quarantine_manager.restore_file(quarantine_id, add_to_whitelist=False); print(f"Restore result: {msg}")
+            elif action.startswith("whitelist:"): success, msg = self.quarantine_manager.restore_file(quarantine_id, add_to_whitelist=True); print(f"Whitelist result: {msg}")
+            elif action.startswith("quarantine:"): print(f"File kept in quarantine: {quarantine_id}")
+        except Exception as e: print(f"Toast action error: {e}")
+    
+    def set_host_scanning(self, enabled):
+        self._config["enable_host_scanning"] = enabled; self._save_config()
+        if self._running: self.stop(); time.sleep(1); self.start()
+    
+    def get_status(self):
+        return {"running": self._running, "host_scanning_enabled": self._config.get("enable_host_scanning", False), "quarantine_count": len(self.quarantine_manager.get_quarantine_list()), "whitelist_count": len(self.whitelist_manager.get_all()), "config": self._config}
+
+
+# Singleton instance
+_scanner_monitor = None
+
+
+def get_scanner_monitor():
+    """Get or create the scanner monitor singleton."""
+    global _scanner_monitor
+    if _scanner_monitor is None:
+        _scanner_monitor = ScannerMonitor()
+    return _scanner_monitor
+
+
+def start_scanner_monitor(enable_host_scanning=False):
+    """Start the scanner monitor service."""
+    monitor = get_scanner_monitor()
+    monitor.enable_host_scanning = enable_host_scanning
+    monitor.start()
+    return monitor
+
+
+def stop_scanner_monitor():
+    """Stop the scanner monitor service."""
+    global _scanner_monitor
+    if _scanner_monitor:
+        _scanner_monitor.stop()
+        _scanner_monitor = None
+
+
+if __name__ == "__main__":
+    # Test/demo mode
+    print("MarekFS Scanner Monitor - Test Mode")
+    print("=" * 50)
+    
+    # Create monitor
+    monitor = ScannerMonitor(enable_host_scanning=False)
+    
+    # Show status
+    print(f"Status: {monitor.get_status()}")
+    
+    # Test quarantine
+    print("\nTesting quarantine system...")
+    test_file = tempfile.NamedTemporaryFile(delete=False, suffix=".exe")
+    test_file.write(b"test malware content")
+    test_file.close()
+    
+    quarantine_id = monitor.quarantine_manager.quarantine_file(
+        test_file.name, "Test-Detection", {"status": "malicious"}
+    )
+    print(f"Quarantine ID: {quarantine_id}")
+    
+    # Test restore
+    print("\nTesting restore...")
+    success, msg = monitor.quarantine_manager.restore_file(quarantine_id)
+    print(f"Restore result: {success} - {msg}")
+    
+    # Cleanup
+    if os.path.exists(test_file.name):
+        os.remove(test_file.name)
+    
+    print("\nQuarantine list:", monitor.quarantine_manager.get_quarantine_list())
+    print("Whitelist:", monitor.whitelist_manager.get_all())
+
+
+# Singleton instance
+_scanner_monitor = None
+
+
+def get_scanner_monitor():
+    """Get or create the scanner monitor singleton."""
+    global _scanner_monitor
+    if _scanner_monitor is None:
+        _scanner_monitor = ScannerMonitor()
+    return _scanner_monitor
+
+
+def start_scanner_monitor(enable_host_scanning=False):
+    """Start the scanner monitor service."""
+    monitor = get_scanner_monitor()
+    monitor.enable_host_scanning = enable_host_scanning
+    monitor.start()
+    return monitor
+
+
+def stop_scanner_monitor():
+    """Stop the scanner monitor service."""
+    global _scanner_monitor
+    if _scanner_monitor:
+        _scanner_monitor.stop()
+        _scanner_monitor = None
+
+
+if __name__ == "__main__":
+    # Test/demo mode
+    print("MarekFS Scanner Monitor - Test Mode")
+    print("=" * 50)
+    
+    # Create monitor
+    monitor = ScannerMonitor(enable_host_scanning=False)
+    
+    # Show status
+    print(f"Status: {monitor.get_status()}")
+    
+    # Test quarantine
+    print("\nTesting quarantine system...")
+    test_file = tempfile.NamedTemporaryFile(delete=False, suffix=".exe")
+    test_file.write(b"test malware content")
+    test_file.close()
+    
+    quarantine_id = monitor.quarantine_manager.quarantine_file(
+        test_file.name, "Test-Detection", {"status": "malicious"}
+    )
+    print(f"Quarantine ID: {quarantine_id}")
+    
+    # Test restore
+    print("\nTesting restore...")
+    success, msg = monitor.quarantine_manager.restore_file(quarantine_id)
+    print(f"Restore result: {success} - {msg}")
+    
+    # Cleanup
+    if os.path.exists(test_file.name):
+        os.remove(test_file.name)
+    
+    print("\nQuarantine list:", monitor.quarantine_manager.get_quarantine_list())
+    print("Whitelist:", monitor.whitelist_manager.get_all())

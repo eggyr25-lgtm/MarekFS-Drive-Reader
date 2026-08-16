@@ -161,6 +161,15 @@ class ModernMarekFSApp:
             except Exception:
                 pass
         self._scanner_prompt_open = False
+        # Background real-time scanner: silently monitors new files for threats,
+        # quarantines them and shows a Windows toast ("Virus moved to quarantine").
+        # Fully guarded so a missing optional module can never break startup.
+        self._realtime_scanner = None
+        try:
+            self.root.after(1500, lambda: threading.Thread(
+                target=self._start_realtime_scanner, daemon=True).start())
+        except Exception:
+            pass
         self.show_hidden = tk.BooleanVar(value=True)
 
         self.cache_blown = True
@@ -521,7 +530,29 @@ class ModernMarekFSApp:
             self.ram_cache.flush()
         except Exception:
             pass
+        try:
+            if self._realtime_scanner is not None:
+                self._realtime_scanner.stop()
+        except Exception:
+            pass
         self.root.destroy()
+
+    def _start_realtime_scanner(self):
+        """Silently scan every new file with the built-in scanner.
+
+        Threats are auto-quarantined and surfaced as a Windows toast
+        ("Virus moved to quarantine"). All failure modes are swallowed so the
+        monitor can never crash the main application.
+        """
+        try:
+            from marekfs_scanner_monitor import start_scanner_monitor
+            self._realtime_scanner = start_scanner_monitor(
+                enable_host_scanning=True, verbose=False)
+        except Exception:
+            # The real-time scanner is best-effort; a failure here must never
+            # take down the main app. Users can still scan on demand via the
+            # Virus Scan window.
+            self._realtime_scanner = None
 
     # --- RAM cache helpers -------------------------------------------------
     def _cache_key(self, filename):
@@ -993,7 +1024,15 @@ class ModernMarekFSApp:
         if len(self.partitions) >= MAX_PARTITIONS:
             messagebox.showwarning("Limit Reached", f"Maximum of {MAX_PARTITIONS} partitions reached.")
             return
-        AddPartitionDialog(self.root, len(self.partitions), self._create_partition_with_size)
+        # Probe the real drive size so the slider can span the whole disk (the
+        # "massive max"). Falls back to the dialog's own 16 TiB default.
+        max_bytes = None
+        try:
+            max_bytes = get_drive_size_bytes(self.drive_path)
+        except Exception:
+            max_bytes = None
+        AddPartitionDialog(self.root, len(self.partitions),
+                           self._create_partition_with_size, max_size_bytes=max_bytes)
 
     def _create_partition_with_size(self, size_bytes):
         """Called by AddPartitionDialog with the user-chosen size in bytes."""

@@ -2,6 +2,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from marekfs_theme import apply_theme, THEME_NAMES
+from marekfs_core import format_bytes, get_drive_size_bytes
 
 
 def theme_existing_window(win, parent=None, title=None, min_size=None):
@@ -37,60 +38,115 @@ def stable_widget_width(widget, chars=20):
 
 
 class AddPartitionDialog:
-    """Dialog for adding a new partition with size selection."""
-    def __init__(self, parent, index, callback):
+    """Dialog for adding a new partition with size selection.
+
+    A big, maximizable window with a horizontal slider that ranges from 4 KiB
+    up to the maximum capacity of the target drive (falls back to 16 TiB when the
+    drive size can't be queried), plus an exact byte entry for precise sizes.
+    The selected size (in bytes) is returned to the caller via the callback.
+    """
+    MIN_SIZE_BYTES = 4096  # 4 KiB
+    DEFAULT_MAX_BYTES = 16 * (1024 ** 4)  # 16 TiB fallback
+
+    def __init__(self, parent, index, callback, max_size_bytes=None):
         self.win = tk.Toplevel(parent)
         self.win.title(f"Add Partition #{index + 1}")
-        self.win.geometry("400x200")
-        self.win.resizable(False, False)
+        self.win.resizable(True, True)
+        # Big, maximizable window.
+        self.win.geometry("760x440")
+        try:
+            self.win.state("zoomed")
+        except tk.TclError:
+            pass
         self.callback = callback
-        
-        # Apply theme
+
+        if max_size_bytes is None:
+            max_size_bytes = self._probe_drive_size(parent)
+        self.max_size_bytes = max(self.MIN_SIZE_BYTES, int(max_size_bytes or self.DEFAULT_MAX_BYTES))
+
         theme_existing_window(self.win, parent)
-        
-        ttk.Label(self.win, text="Partition Size:", font=("Segoe UI", 10, "bold")).pack(pady=10)
-        
-        # Size options in GB
-        sizes = [
-            ("1 GB", 1024 * 1024 * 1024),
-            ("2 GB", 2 * 1024 * 1024 * 1024),
-            ("5 GB", 5 * 1024 * 1024 * 1024),
-            ("10 GB", 10 * 1024 * 1024 * 1024),
-            ("20 GB", 20 * 1024 * 1024 * 1024),
-            ("50 GB", 50 * 1024 * 1024 * 1024),
-            ("100 GB", 100 * 1024 * 1024 * 1024),
-        ]
-        
-        self.size_var = tk.StringVar(value="5 GB")
-        size_frame = ttk.Frame(self.win)
-        size_frame.pack(pady=10)
-        
-        for label, _ in sizes:
-            ttk.Radiobutton(size_frame, text=label, variable=self.size_var, value=label).pack(anchor=tk.W)
-        
-        btn_frame = ttk.Frame(self.win)
-        btn_frame.pack(pady=15)
-        
-        ttk.Button(btn_frame, text="Create", command=self._create, style="Accent.TButton").pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=self.win.destroy).pack(side=tk.LEFT, padx=5)
-        
+
+        start_val = min(5 * 1024 ** 3, self.max_size_bytes)
+        self._size_var = tk.IntVar(value=start_val)
+        self._display_var = tk.StringVar()
+
+        ttk.Label(self.win, text="Partition Size",
+                  font=("Segoe UI", 14, "bold")).pack(pady=(22, 4))
+        ttk.Label(self.win, text=f"Slide from 4 KiB up to {format_bytes(self.max_size_bytes)}.",
+                  font=("Segoe UI", 9)).pack(pady=0)
+
+        self._scale = ttk.Scale(self.win, orient=tk.HORIZONTAL,
+                                from_=self.MIN_SIZE_BYTES, to=self.max_size_bytes,
+                                variable=self._size_var, command=self._on_scale)
+        self._scale.pack(fill=tk.X, padx=30, pady=(18, 8))
+
+        entry_row = ttk.Frame(self.win)
+        entry_row.pack(pady=6)
+        ttk.Label(entry_row, text="Exact size (bytes):",
+                  font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        vcmd = (self.win.register(self._validate_bytes), "%P")
+        self._entry_var = tk.StringVar()
+        self._entry = ttk.Entry(entry_row, textvariable=self._entry_var, width=18,
+                                validate="key", validatecommand=vcmd)
+        self._entry.pack(side=tk.LEFT)
+        self._entry.bind("<FocusOut>", self._on_entry_focus_out)
+        ttk.Label(entry_row, textvariable=self._display_var,
+                  font=("Segoe UI", 10, "bold"), foreground="#ffcc00").pack(side=tk.LEFT, padx=12)
+
+        btn_row = ttk.Frame(self.win)
+        btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 24))
+        ttk.Button(btn_row, text="Create", command=self._create,
+                   style="Accent.TButton").pack(side=tk.LEFT, padx=8)
+        ttk.Button(btn_row, text="Cancel", command=self.win.destroy).pack(side=tk.LEFT, padx=8)
+
+        self._sync_display()
+        self._entry_var.set(str(self._size_var.get()))
+
         self.win.transient(parent)
         self.win.grab_set()
-    
+
+    def _probe_drive_size(self, parent):
+        try:
+            drive = getattr(parent, "drive_path", None)
+            if drive:
+                return get_drive_size_bytes(drive)
+        except Exception:
+            pass
+        return None
+
+    def _on_scale(self, *_):
+        self._sync_display()
+        self._entry_var.set(str(int(self._size_var.get())))
+
+    def _sync_display(self):
+        val = int(self._size_var.get())
+        self._display_var.set(f"{format_bytes(val)} ({val:,} bytes)")
+
+    def _validate_bytes(self, proposed):
+        if proposed == "":
+            return True
+        try:
+            v = int(proposed)
+        except ValueError:
+            return False
+        return self.MIN_SIZE_BYTES <= v <= self.max_size_bytes
+
+    def _on_entry_focus_out(self, *_):
+        try:
+            v = int(self._entry.get())
+        except ValueError:
+            v = self._size_var.get()
+        v = max(self.MIN_SIZE_BYTES, min(self.max_size_bytes, v))
+        self._size_var.set(v)
+        self._sync_display()
+        self._entry_var.set(str(v))
+
     def _create(self):
-        sizes = {
-            "1 GB": 1024 * 1024 * 1024,
-            "2 GB": 2 * 1024 * 1024 * 1024,
-            "5 GB": 5 * 1024 * 1024 * 1024,
-            "10 GB": 10 * 1024 * 1024 * 1024,
-            "20 GB": 20 * 1024 * 1024 * 1024,
-            "50 GB": 50 * 1024 * 1024 * 1024,
-            "100 GB": 100 * 1024 * 1024 * 1024,
-        }
-        size = sizes.get(self.size_var.get(), 5 * 1024 * 1024 * 1024)
+        size = max(self.MIN_SIZE_BYTES, min(self.max_size_bytes, int(self._size_var.get())))
         self.win.destroy()
         if self.callback:
             self.callback(size)
+
 
 
 class WallpaperManager:

@@ -1343,13 +1343,13 @@ def _heuristic_scan(name, data):
     protected_paths = ("\\program files", "\\programdata", "\\windows", "/program files", "/programdata", "/windows")
     encryption_terms = ("cryptencrypt", "cryptprotectdata", "encrypting file system", "ransom", "aes_encrypt", "chacha20", "file encryption")
     if unsigned:
-        findings.append({"severity": "warning", "rule": "unsigned-executable", "detail": "Executable appears unsigned; signature absence alone is not proof of malware."})
+        findings.append({"severity": "warning", "rule": "unsigned-executable", "source": "heuristic", "detail": "Executable appears unsigned; signature absence alone is not proof of malware."})
     if any(term in text for term in delete_terms) and any(path in text for path in protected_paths):
-        findings.append({"severity": "high" if unsigned else "warning", "rule": "protected-path-delete", "detail": "Static strings suggest deletion of protected Windows/application paths."})
+        findings.append({"severity": "high" if unsigned else "warning", "rule": "protected-path-delete", "source": "heuristic", "detail": "Static strings suggest deletion of protected Windows/application paths."})
     if unsigned and any(term in text for term in encryption_terms):
-        findings.append({"severity": "high", "rule": "unsigned-file-encryption", "detail": "Unsigned executable contains file-encryption indicators."})
+        findings.append({"severity": "high", "rule": "unsigned-file-encryption", "source": "heuristic", "detail": "Unsigned executable contains file-encryption indicators. Heuristics alone are not proof of malware; require a malware signature to auto-quarantine."})
     if any(term in text for term in ("powershell -enc", "frombase64string", "invoke-expression", "regsvr32", "rundll32")):
-        findings.append({"severity": "warning", "rule": "suspicious-loader-string", "detail": "Contains a common script/proxy execution indicator."})
+        findings.append({"severity": "warning", "rule": "suspicious-loader-string", "source": "heuristic", "detail": "Contains a common script/proxy execution indicator."})
     return findings
 
 
@@ -1371,10 +1371,10 @@ def scan_bytes_with_builtin_scanner(name, data, config=None):
     if (data == EICAR_SIGNATURE or digest == EICAR_SHA256 or
             eicar_normalized == EICAR_SIGNATURE or
             hashlib.sha256(eicar_normalized).hexdigest() == EICAR_SHA256):
-        findings.append({"severity": "high", "rule": "eicar-test-file", "detail": "EICAR anti-malware test signature detected; this is a harmless test marker, not live malware."})
+        findings.append({"severity": "high", "rule": "eicar-test-file", "source": "signature", "detail": "EICAR anti-malware test signature detected; this is a harmless test marker, not live malware."})
     known = db.get(digest)
     if known:
-        findings.append({"severity": known.get("severity", "high"), "rule": "known-hash", "detail": known.get("detail", "Hash is present in the local malware database.")})
+        findings.append({"severity": known.get("severity", "high"), "rule": "known-hash", "source": "signature", "detail": known.get("detail", "Hash is present in the local malware database.")})
     if cfg.get("heuristics_enabled", True):
         findings.extend(_heuristic_scan(name, data))
     yara_status = "disabled"
@@ -1388,7 +1388,7 @@ def scan_bytes_with_builtin_scanner(name, data, config=None):
                     try:
                         compiled = yara.compile(filepath=rule_path)
                         for match in compiled.match(data=data, timeout=10):
-                            findings.append({"severity": "high", "rule": match.rule, "detail": "Matched a cached YARA rule."})
+                            findings.append({"severity": "high", "rule": match.rule, "detail": "Matched a cached YARA rule.", "source": "signature"})
                         usable += 1
                     except Exception:
                         continue
@@ -1399,8 +1399,13 @@ def scan_bytes_with_builtin_scanner(name, data, config=None):
             yara_status = "unavailable"
         except Exception as e:
             yara_status = f"error: {e}"
-    high = any(x.get("severity") == "high" for x in findings)
-    return {"status": "malicious" if high else ("suspicious" if findings else "clean"),
+    # "malicious" (>= auto-quarantine) requires a CONFIRMED malware signature
+    # (EICAR / known-hash / a YARA rule with source="signature"). Pure behavioral
+    # heuristics (unsigned executable, encryption indicators, protected-path
+    # deletes, loader strings) are "suspicious": notify, never auto-quarantine.
+    signature_high = any(
+        x.get("severity") == "high" and x.get("source") == "signature" for x in findings)
+    return {"status": "malicious" if signature_high else ("suspicious" if findings else "clean"),
             "name": name, "sha256": digest, "yara": yara_status, "findings": findings}
 
 
